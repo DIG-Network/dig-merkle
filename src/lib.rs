@@ -89,8 +89,7 @@ pub mod oracle {}
 /// Terminally spend (melt) the DataLayer coin, leaving no successor (future unit, SPEC §3.5).
 pub mod melt {}
 
-/// Parse the current on-chain DataLayer state without spending (future unit, SPEC §3.6).
-pub mod read {}
+pub mod read;
 
 /// Reconstruct a spendable [`crate::DataStore`] from a parent coin spend, fail-closed (future unit,
 /// SPEC §5).
@@ -109,6 +108,7 @@ pub use error::{MerkleError, MerkleResult};
 pub use hint::{digstore_owner_hint, DATASTORE_LAUNCHER_HINT, DIGSTORE_OWNER_HINT_DOMAIN};
 pub use metadata::DigDataStoreMetadata;
 pub use mint::mint_datastore;
+pub use read::{did_ref_from_spend, DidRef};
 pub use sign::required_signatures;
 pub use types::{
     Bytes32, Coin, CoinSpend, DataStore, DataStoreInfo, DataStoreMetadata, DelegatedPuzzle,

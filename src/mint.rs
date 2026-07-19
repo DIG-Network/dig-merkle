@@ -2,8 +2,9 @@
 //!
 //! [`mint_datastore`] builds the unsigned coin spends that launch a fresh CHIP-0035 DataLayer
 //! singleton whose `launcher_id` becomes the DIG `store_id`. It funds the launcher from a caller-
-//! supplied `parent_coin`, curries the store's [`DataStoreMetadata`] (the anchored merkle
-//! `root_hash` plus optional label/description/bytes/size-proof) and delegated-puzzle set, and — the
+//! supplied `parent_coin`, curries the store's [`DigDataStoreMetadata`] (the anchored merkle
+//! `root_hash` plus optional label/description/bytes/size-proof/program-hash) and delegated-puzzle
+//! set, and — the
 //! load-bearing detail — overrides the launcher `CREATE_COIN` memos to the two-memo owner-discovery
 //! hint so a minted store is byte-identical to the stores chip35_dl_coin and digstore-chain already
 //! publish on-chain (SPEC §9).
