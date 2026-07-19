@@ -7,15 +7,15 @@
 # consumer signs the reported messages, assembles the SpendBundle, and broadcasts. See SPEC.md for
 # the normative contract.
 #
-# U1 (this milestone) ships the crate foundation: the type surface (`DataStore`, `DataStoreMetadata`,
-# `DataStoreInfo`, `DelegatedPuzzle`, `MerkleCoinSpend`, `Owner`), the error taxonomy, the
-# inner-spend construction helpers, and the load-bearing signing boundary (`required_signatures`).
-# The DataLayer operations (mint/update/delegation/oracle/melt/read/hydrate/…) arrive in their own
-# units against this foundation — their modules are declared as doc-only stubs so the layout is
-# final.
+# The crate foundation (U1): the type surface (`DataStore`, `DataStoreMetadata`, `DataStoreInfo`,
+# `DelegatedPuzzle`, `MerkleCoinSpend`, `Owner`), the error taxonomy, the inner-spend helpers, and
+# the load-bearing signing boundary (`required_signatures`). U2 adds `mint_datastore` (the DataLayer
+# store mint, byte-identical to on-chain stores) + the owner-discovery hint. The remaining DataLayer
+# operations (update/delegation/oracle/melt/read/hydrate/…) arrive in their own units against this
+# foundation — their modules are declared as doc-only stubs so the layout is final.
 [package]
 name = "dig-merkle"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -43,6 +43,11 @@ chia-wallet-sdk = { version = "0.30", features = ["chip-0035"] }
 chia-protocol = "0.26"
 chia-puzzle-types = "0.26"
 clvm-traits = "0.26"
+# The SHA-256 used for the digstore owner-discovery hint. chia-sha2 is the exact hasher the existing
+# on-chain producers (chip35_dl_coin, digstore-chain) use, so the hint bytes match byte-for-byte.
+chia-sha2 = "0.26"
+# Compile-time hex literals for the two pinned hint constants (SPEC §9), kept human-verifiable.
+hex-literal = "0.4"
 # The crate error taxonomy (SPEC §6). thiserror 2 matches the sibling DIG crates.
 thiserror = "2"
 
@@ -51,3 +56,5 @@ thiserror = "2"
 chia-sdk-test = "0.30"
 # Hex assertions on computed signature messages / coin ids in tests.
 hex = "0.4"
+# Ergonomic `?`-propagating Result for the simulator integration tests.
+anyhow = "1"
