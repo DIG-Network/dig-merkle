@@ -19,7 +19,8 @@ use hex_literal::hex;
 
 use crate::context::{drain_coin_spends, inner_spend};
 use crate::hint::{digstore_owner_hint, DATASTORE_LAUNCHER_HINT};
-use crate::types::{Bytes32, Coin, DataStoreMetadata, DelegatedPuzzle, MerkleCoinSpend, Owner};
+use crate::metadata::DigDataStoreMetadata;
+use crate::types::{Bytes32, Coin, DelegatedPuzzle, MerkleCoinSpend, Owner};
 use crate::MerkleResult;
 
 /// The well-known singleton launcher puzzle hash. A `CREATE_COIN` to this puzzle hash mints the
@@ -37,6 +38,11 @@ const SINGLETON_LAUNCHER_HASH: Bytes32 = Bytes32::new(hex!(
 /// as change to `owner_puzzle_hash`. The `fee` is paid implicitly as the difference between the
 /// parent coin's value and the launcher + change amounts — no explicit `RESERVE_FEE` condition,
 /// matching the on-chain producers byte-for-byte.
+///
+/// `program_hash` optionally anchors the CLVM tree-hash of a program/puzzle associated with the
+/// store/capsule; it is stored and echoed verbatim in the store metadata (CLVM key `"p"`, appended
+/// last) and is `None` for an ordinary store — a `None` mint is byte-identical to the SDK's default
+/// metadata (SPEC §2/§8). dig-merkle never computes `program_hash`; the producer passes it in.
 ///
 /// `owner_puzzle_hash` is the store owner recorded in the singleton (and the target of the owner
 /// discovery hint + any change); `delegated_puzzles` grants admin/writer/oracle authority. The
@@ -69,6 +75,7 @@ pub fn mint_datastore(
     description: Option<String>,
     bytes: Option<u64>,
     size_proof: Option<String>,
+    program_hash: Option<Bytes32>,
     owner_puzzle_hash: Bytes32,
     delegated_puzzles: Vec<DelegatedPuzzle>,
     fee: u64,
@@ -79,12 +86,13 @@ pub fn mint_datastore(
     // `launch_conditions` are what the funding coin must emit to create the launcher coin.
     let (launch_conditions, datastore) = Launcher::new(parent_coin.coin_id(), 1).mint_datastore(
         &mut ctx,
-        DataStoreMetadata {
+        DigDataStoreMetadata {
             root_hash,
             label,
             description,
             bytes,
             size_proof,
+            program_hash,
         },
         owner_puzzle_hash.into(),
         delegated_puzzles,
@@ -156,7 +164,7 @@ fn override_launcher_hint(
 mod tests {
     use super::*;
     use crate::required_signatures;
-    use crate::types::{DataStore, DataStoreMetadata};
+    use crate::types::DataStore;
     use chia_puzzle_types::standard::StandardArgs;
     use chia_puzzle_types::Memos;
     use chia_wallet_sdk::driver::SpendContext;
@@ -224,6 +232,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             owner_ph,
             vec![],
             1_000,
@@ -238,19 +247,20 @@ mod tests {
         );
     }
 
-    /// Golden root-encoding pin: `DataStoreMetadata` CLVM has the `root_hash` as its first atom, so a
-    /// reader recovers the anchored root unchanged (SPEC §8). We assert via the SDK encoder (INV-4)
-    /// that the car of the metadata CLVM equals `root_hash`.
+    /// Golden root-encoding pin: `DigDataStoreMetadata` CLVM has the `root_hash` as its first atom,
+    /// so a reader recovers the anchored root unchanged (SPEC §8). We assert via the encoder that the
+    /// car of the metadata CLVM equals `root_hash`.
     #[test]
     fn metadata_clvm_encodes_root_as_first_atom() {
         let mut ctx = SpendContext::new();
         let root = Bytes32::new([0xcd; 32]);
-        let metadata = DataStoreMetadata {
+        let metadata = DigDataStoreMetadata {
             root_hash: root,
             label: Some("site".into()),
             description: Some("desc".into()),
             bytes: Some(42),
             size_proof: None,
+            program_hash: None,
         };
         let node = metadata.to_clvm(&mut *ctx).expect("encode metadata");
         let (car, _rest) = <(Bytes32, NodePtr)>::from_clvm(&*ctx, node)
@@ -275,6 +285,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             owner_ph,
             vec![],
             0,
@@ -291,8 +302,9 @@ mod tests {
             .iter()
             .find(|s| s.coin.coin_id() == datastore.info.launcher_id)
             .expect("launcher-coin spend present");
-        let hydrated = DataStore::<DataStoreMetadata>::from_spend(&mut ctx, launcher_spend, &[])?
-            .expect("launcher spend hydrates a datastore");
+        let hydrated =
+            DataStore::<DigDataStoreMetadata>::from_spend(&mut ctx, launcher_spend, &[])?
+                .expect("launcher spend hydrates a datastore");
 
         assert_eq!(hydrated.info.metadata.root_hash, root);
         assert_eq!(hydrated.info.owner_puzzle_hash, owner_ph);
@@ -312,6 +324,7 @@ mod tests {
             parent,
             Owner::Standard(owner_pk),
             Bytes32::new([0x01; 32]),
+            None,
             None,
             None,
             None,
@@ -347,6 +360,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             owner_ph,
             vec![],
             0,
@@ -368,5 +382,147 @@ mod tests {
             1,
             "only the launcher CREATE_COIN, no change"
         );
+    }
+
+    /// Builds the same coin spends `mint_datastore` does but currying the SDK's `DataStoreMetadata`
+    /// (no `program_hash`), so a byte-identity comparison isolates JUST the metadata type swap.
+    #[allow(clippy::too_many_arguments)]
+    fn reference_sdk_mint(
+        parent_coin: Coin,
+        owner_pk: chia_wallet_sdk::prelude::PublicKey,
+        root: Bytes32,
+        label: Option<String>,
+        description: Option<String>,
+        bytes: Option<u64>,
+        size_proof: Option<String>,
+        owner_puzzle_hash: Bytes32,
+        fee: u64,
+    ) -> Vec<crate::types::CoinSpend> {
+        use chia_wallet_sdk::driver::DataStoreMetadata;
+
+        let mut ctx = SpendContext::new();
+        let (launch_conditions, _datastore) = Launcher::new(parent_coin.coin_id(), 1)
+            .mint_datastore(
+                &mut ctx,
+                DataStoreMetadata {
+                    root_hash: root,
+                    label,
+                    description,
+                    bytes,
+                    size_proof,
+                },
+                owner_puzzle_hash.into(),
+                vec![],
+            )
+            .expect("reference mint builds");
+        let launch_conditions =
+            override_launcher_hint(&mut ctx, launch_conditions, owner_puzzle_hash)
+                .expect("reference hint override");
+
+        let reserved = fee + 1;
+        let owner_conditions = if parent_coin.amount > reserved {
+            let change_hint = ctx.hint(owner_puzzle_hash).expect("hint");
+            launch_conditions.create_coin(
+                owner_puzzle_hash,
+                parent_coin.amount - reserved,
+                change_hint,
+            )
+        } else {
+            launch_conditions
+        };
+        let owner_spend =
+            crate::context::inner_spend(&mut ctx, Owner::Standard(owner_pk), owner_conditions)
+                .expect("reference owner spend");
+        ctx.spend(parent_coin, owner_spend)
+            .expect("reference parent spend");
+        crate::context::drain_coin_spends(&mut ctx)
+    }
+
+    /// LOAD-BEARING back-compat proof (§5.1): a mint with `program_hash == None` produces coin spends
+    /// BYTE-IDENTICAL to a mint currying the SDK's own `DataStoreMetadata` — so an ordinary DIG store
+    /// is indistinguishable on chain from a plain DataLayer store.
+    #[test]
+    fn mint_none_program_hash_is_byte_identical() {
+        let (owner_pk, owner_ph) = seeded_owner();
+        let parent = Coin::new(Bytes32::new([0x44; 32]), owner_ph, 1_000_000);
+        let root = Bytes32::new([0xba; 32]);
+
+        let dig = mint_datastore(
+            parent,
+            Owner::Standard(owner_pk),
+            root,
+            Some("store".into()),
+            None,
+            Some(10),
+            None,
+            None,
+            owner_ph,
+            vec![],
+            1_000,
+        )
+        .expect("dig mint builds");
+
+        let reference = reference_sdk_mint(
+            parent,
+            owner_pk,
+            root,
+            Some("store".into()),
+            None,
+            Some(10),
+            None,
+            owner_ph,
+            1_000,
+        );
+
+        assert_eq!(
+            dig.coin_spends, reference,
+            "a None-program_hash mint must be byte-identical to an SDK-metadata mint"
+        );
+    }
+
+    /// A mint carrying a `program_hash` validates on the simulator and hydrates back with BOTH the
+    /// anchored root and the program hash preserved (SPEC §2/§5 roundtrip).
+    #[test]
+    fn mint_with_program_hash_hydrates() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let owner = sim.bls(1_000_000);
+        let owner_ph: Bytes32 = StandardArgs::curry_tree_hash(owner.pk).into();
+        let root = Bytes32::new([0x5b; 32]);
+        let program_hash = Bytes32::new([0xcc; 32]);
+
+        let built = mint_datastore(
+            owner.coin,
+            Owner::Standard(owner.pk),
+            root,
+            None,
+            None,
+            None,
+            None,
+            Some(program_hash),
+            owner_ph,
+            vec![],
+            0,
+        )?;
+        let datastore = built.child.clone().expect("mint yields a child datastore");
+
+        sim.spend_coins(built.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
+
+        let mut ctx = SpendContext::new();
+        let launcher_spend = built
+            .coin_spends
+            .iter()
+            .find(|s| s.coin.coin_id() == datastore.info.launcher_id)
+            .expect("launcher-coin spend present");
+        let hydrated =
+            DataStore::<DigDataStoreMetadata>::from_spend(&mut ctx, launcher_spend, &[])?
+                .expect("launcher spend hydrates a datastore");
+
+        assert_eq!(hydrated.info.metadata.root_hash, root);
+        assert_eq!(
+            hydrated.info.metadata.program_hash,
+            Some(program_hash),
+            "the program_hash survives the on-chain roundtrip"
+        );
+        Ok(())
     }
 }

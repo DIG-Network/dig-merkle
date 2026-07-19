@@ -8,6 +8,8 @@
 use chia_wallet_sdk::driver::Spend;
 use chia_wallet_sdk::prelude::PublicKey;
 
+use crate::metadata::DigDataStoreMetadata;
+
 // Re-exported from chia-wallet-sdk so consumers of dig-merkle never need a direct SDK dependency to
 // name the DataLayer coin it produces. These are the canonical Chia CHIP-0035 types (gated behind
 // the SDK's `chip-0035` feature) — dig-merkle adds no shadow copy (INV-4).
@@ -29,13 +31,17 @@ pub struct MerkleCoinSpend {
     pub coin_spends: Vec<CoinSpend>,
 
     /// The DataStore as it will exist after these spends confirm, or `None` for a terminal
-    /// operation.
-    pub child: Option<DataStore>,
+    /// operation. Its metadata is the DIG superset [`DigDataStoreMetadata`] (root + optional
+    /// label/description/bytes/size-proof/program-hash).
+    pub child: Option<DataStore<DigDataStoreMetadata>>,
 }
 
 impl MerkleCoinSpend {
     /// Creates a [`MerkleCoinSpend`] from its coin spends and (optional) recreated child DataStore.
-    pub fn new(coin_spends: Vec<CoinSpend>, child: Option<DataStore>) -> Self {
+    pub fn new(
+        coin_spends: Vec<CoinSpend>,
+        child: Option<DataStore<DigDataStoreMetadata>>,
+    ) -> Self {
         Self { coin_spends, child }
     }
 }

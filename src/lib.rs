@@ -71,6 +71,8 @@ pub mod types;
 // The DataLayer operation modules — declared now so the crate layout is final; each is filled in
 // its own unit (doc-only until then, so they add no untested surface).
 
+pub mod metadata;
+
 pub mod mint;
 
 /// Recreate the DataLayer coin with a new merkle root — an owner or writer update (future unit,
@@ -105,6 +107,7 @@ pub mod fee {}
 // The curated public surface — consumers depend on these paths, not the module layout.
 pub use error::{MerkleError, MerkleResult};
 pub use hint::{digstore_owner_hint, DATASTORE_LAUNCHER_HINT, DIGSTORE_OWNER_HINT_DOMAIN};
+pub use metadata::DigDataStoreMetadata;
 pub use mint::mint_datastore;
 pub use sign::required_signatures;
 pub use types::{
