@@ -21,10 +21,6 @@ use crate::MerkleResult;
 ///   ignored for this variant — the caller owns the inner spend end to end.
 ///
 /// Consumed by every DataLayer operation module (mint, update, delegation, and beyond).
-// U1 ships this foundation helper before the operation modules that call it; it is exercised by the
-// unit tests below and consumed by mint/update/... in their own units. `allow(dead_code)` keeps the
-// crate warning-clean until then without hiding a real unused symbol.
-#[allow(dead_code)]
 pub(crate) fn inner_spend(
     ctx: &mut SpendContext,
     owner: Owner,
@@ -43,9 +39,6 @@ pub(crate) fn inner_spend(
 ///
 /// A thin wrapper over [`SpendContext::take`] that names the intent at the DataLayer call sites.
 /// Consumed by every operation module that returns a [`crate::MerkleCoinSpend`].
-// See the `inner_spend` note above — a U1 foundation helper used by the tests now and the operation
-// modules in their own units.
-#[allow(dead_code)]
 pub(crate) fn drain_coin_spends(ctx: &mut SpendContext) -> Vec<chia_protocol::CoinSpend> {
     ctx.take()
 }

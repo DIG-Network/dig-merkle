@@ -63,12 +63,14 @@ let required = required_signatures(&spend.coin_spends, &constants)?;
 ## Operation surface
 
 Each operation returns an unsigned `MerkleCoinSpend` and states its signing requirement.
-**U1 (v0.1.0) ships the foundation** — the type surface, error taxonomy, inner-spend helpers, and
-the signing boundary. The operations below are the designed surface; each lands in its own unit.
+**U2 (v0.2.0)** ships the mint builder + the owner-discovery hint on top of the U1 foundation (type
+surface, error taxonomy, inner-spend helpers, signing boundary). The remaining operations are the
+designed surface; each lands in its own unit.
 
 | Function | Semantics | Signing |
 |---|---|---|
-| `mint::mint_root_from_launcher(parent_coin_id, metadata, owner_ph, delegated)` | launch a new DataLayer coin anchoring a root | parent/DID coin's `AGG_SIG_ME` |
+| `mint::mint_datastore(parent_coin, owner, root_hash, label, description, bytes, size_proof, owner_ph, delegated, fee)` | **shipped** — launch a new DataLayer store anchoring a root, byte-identical to on-chain stores | owner's `AGG_SIG_ME` |
+| `digstore_owner_hint(owner_ph)` / `DATASTORE_LAUNCHER_HINT` / `DIGSTORE_OWNER_HINT_DOMAIN` | **shipped** — the owner-discovery hint (SPEC §9) | — |
 | `update::update_root(store, owner, new_metadata)` | recreate the coin with a new merkle root | owner or writer/admin `AGG_SIG_ME` |
 | `delegation::set_delegated_puzzles(store, owner, set)` | grant/revoke admin/writer/oracle authority (admin-only) | owner or admin `AGG_SIG_ME` |
 | `oracle::oracle_spend(store)` | read the coin on-chain for the fixed oracle fee | none (keyless oracle puzzle) |
@@ -78,12 +80,22 @@ the signing boundary. The operations below are the designed surface; each lands 
 | `lineage::*` | derive the `LineageProof` a child spend needs | — |
 | `required_signatures(...)` | **shipped** — the signing boundary (§4) | — |
 
+### The two-memo launcher hint (byte-identity)
+
+`mint_datastore` overrides the launcher `CREATE_COIN` memos to exactly
+`[digstore_owner_hint(owner_ph), DATASTORE_LAUNCHER_HINT]` — the first the indexed owner-discovery
+hint (`sha256("dig:datastore:owner:v1" ‖ owner_ph)`), the second the global launcher hint
+(`sha256("datastore")`). This replicates `chip35_dl_coin` and `digstore-chain` exactly, so a store
+minted here is byte-identical to (and interchangeable with) the stores those already publish
+on-chain. It is the default behaviour, verified by a golden test.
+
 ### DID composition
 
-`mint_root_from_launcher` takes a **`parent_coin_id`**, not a full launcher, so a DID-authorized
-launcher produced by [`dig-did`](https://crates.io/crates/dig-did) composes here **without a
-`dig-did` dependency**. The dependency edge is one-way (dig-identity → dig-merkle); dig-merkle never
-depends on a `dig-*` crate.
+`mint_datastore` takes a **`parent_coin`**, not a full launcher, so a DID-authorized launcher
+produced by [`dig-did`](https://crates.io/crates/dig-did) composes here **without a `dig-did`
+dependency**: pass the DID coin as `parent_coin` with an `Owner::Custom` inner spend that satisfies
+the DID puzzle. The dependency edge is one-way (dig-identity → dig-merkle); dig-merkle never depends
+on a `dig-*` crate.
 
 ## Module map
 
@@ -92,8 +104,10 @@ depends on a `dig-*` crate.
   `LineageProof`, `Proof`).
 - `error` — `MerkleError` / `MerkleResult` (the error taxonomy, SPEC §6).
 - `sign` — `required_signatures` (the signing boundary, SPEC §4).
-- `mint` / `update` / `delegation` / `oracle` / `melt` / `read` / `hydrate` / `lineage` / `hint` /
-  `fee` — the DataLayer operation modules (doc-only stubs in U1; each filled in its own unit).
+- `mint` — `mint_datastore` (shipped, SPEC §3.1).
+- `hint` — `digstore_owner_hint` + the two hint constants (shipped, SPEC §9).
+- `update` / `delegation` / `oracle` / `melt` / `read` / `hydrate` / `lineage` / `fee` — the remaining
+  DataLayer operation modules (doc-only stubs; each filled in its own unit).
 
 ## Custody guarantee
 

@@ -71,11 +71,7 @@ pub mod types;
 // The DataLayer operation modules — declared now so the crate layout is final; each is filled in
 // its own unit (doc-only until then, so they add no untested surface).
 
-/// Launch a new DataLayer coin anchoring a `.dig` merkle root (future unit).
-///
-/// `mint_root_from_launcher` will take a `parent_coin_id` so a DID-authorized launcher produced by
-/// `dig-did` composes here without a `dig-did` dependency (SPEC §3.1).
-pub mod mint {}
+pub mod mint;
 
 /// Recreate the DataLayer coin with a new merkle root — an owner or writer update (future unit,
 /// SPEC §3.2).
@@ -101,14 +97,15 @@ pub mod hydrate {}
 /// Derive the [`crate::LineageProof`] a child DataLayer spend requires (future unit, SPEC §5).
 pub mod lineage {}
 
-/// The owner/delegation hint-memo domain `b"dig:datastore:owner:v1"` (future unit, SPEC §9).
-pub mod hint {}
+pub mod hint;
 
 /// Attach a reserve fee condition to any DataLayer operation (future unit, SPEC §3).
 pub mod fee {}
 
 // The curated public surface — consumers depend on these paths, not the module layout.
 pub use error::{MerkleError, MerkleResult};
+pub use hint::{digstore_owner_hint, DATASTORE_LAUNCHER_HINT, DIGSTORE_OWNER_HINT_DOMAIN};
+pub use mint::mint_datastore;
 pub use sign::required_signatures;
 pub use types::{
     Bytes32, Coin, CoinSpend, DataStore, DataStoreInfo, DataStoreMetadata, DelegatedPuzzle,
