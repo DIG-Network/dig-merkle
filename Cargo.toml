@@ -15,7 +15,7 @@
 # foundation — their modules are declared as doc-only stubs so the layout is final.
 [package]
 name = "dig-merkle"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -46,6 +46,10 @@ clvm-traits = "0.26"
 # The SHA-256 used for the digstore owner-discovery hint. chia-sha2 is the exact hasher the existing
 # on-chain producers (chip35_dl_coin, digstore-chain) use, so the hint bytes match byte-for-byte.
 chia-sha2 = "0.26"
+# The canonical reads-only Chia chain interface (a reference-DOWN pure leaf, no I/O of its own). It
+# supplies the injected `ChainSource` trait that `resolve_owner_did` walks to prove a store's owning
+# DID from chain, keeping dig-merkle itself network-free (INV-1).
+dig-chainsource-interface = "0.1"
 # Compile-time hex literals for the two pinned hint constants (SPEC §9), kept human-verifiable.
 hex-literal = "0.4"
 # The crate error taxonomy (SPEC §6). thiserror 2 matches the sibling DIG crates.
@@ -54,6 +58,8 @@ thiserror = "2"
 [dev-dependencies]
 # The in-process Chia Simulator + BLS keypair helpers for building real coin spends in tests.
 chia-sdk-test = "0.30"
+# The in-memory MockChainSource (behind `testing`) for wiring fail-closed fixture chains under test.
+dig-chainsource-interface = { version = "0.1", features = ["testing"] }
 # Hex assertions on computed signature messages / coin ids in tests.
 hex = "0.4"
 # Ergonomic `?`-propagating Result for the simulator integration tests.

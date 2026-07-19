@@ -58,6 +58,14 @@ pub enum MerkleError {
     #[error("chain precondition failed: {0}")]
     Chain(String),
 
+    /// The injected [`dig_chainsource_interface::ChainSource`] could NOT reliably answer a read
+    /// (transport/timeout/malformed/unsupported). Distinct from a genuine absence (`Ok(None)`):
+    /// the chain state is UNKNOWN, so every owner-attribution caller MUST fail closed and never
+    /// treat this as "no owner" (NC-9, SPEC §3.7). The string is the source's own error rendered
+    /// verbatim, so this crate does not leak the source's error type into its public surface.
+    #[error("chain source error: {0}")]
+    Source(String),
+
     /// An operation was asked to spend an empty coin set (SPEC §6).
     #[error("no coins supplied to spend")]
     EmptyCoins,
