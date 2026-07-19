@@ -1,0 +1,53 @@
+# dig-merkle — the DIG Network canonical CHIP-0035 DataLayer coin expert crate.
+#
+# A pure, key-free, network-free SpendBundle-builder library for the Chia CHIP-0035 DataLayer
+# singleton that anchors a `.dig` file's merkle root on-chain. dig-merkle constructs the exact
+# CoinSpends for every DataLayer-coin lifecycle operation and reports the exact signatures a caller
+# must produce — it NEVER holds a secret key, NEVER signs, and NEVER touches the network. The
+# consumer signs the reported messages, assembles the SpendBundle, and broadcasts. See SPEC.md for
+# the normative contract.
+#
+# U1 (this milestone) ships the crate foundation: the type surface (`DataStore`, `DataStoreMetadata`,
+# `DataStoreInfo`, `DelegatedPuzzle`, `MerkleCoinSpend`, `Owner`), the error taxonomy, the
+# inner-spend construction helpers, and the load-bearing signing boundary (`required_signatures`).
+# The DataLayer operations (mint/update/delegation/oracle/melt/read/hydrate/…) arrive in their own
+# units against this foundation — their modules are declared as doc-only stubs so the layout is
+# final.
+[package]
+name = "dig-merkle"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+license = "Apache-2.0 OR MIT"
+description = "The DIG Network canonical CHIP-0035 DataLayer coin expert crate: a pure, key-free, network-free SpendBundle-builder for the Chia DataLayer singleton that anchors a .dig file's merkle root on-chain. Builds the exact CoinSpends for every DataLayer-coin lifecycle operation and reports the exact signatures a caller must produce — never holds a key, never signs, never broadcasts."
+repository = "https://github.com/DIG-Network/dig-merkle"
+readme = "README.md"
+keywords = ["dig", "chia", "datalayer", "chip-0035", "singleton"]
+categories = ["cryptography::cryptocurrencies", "api-bindings"]
+
+[lib]
+# rlib for native consumers; cdylib so a later unit can compile a wasm façade over the same crate.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The chia-wallet-sdk umbrella is the byte-source-of-truth for every DataLayer puzzle, layer, and
+# spend (INV-4). Pinned to the 0.30 family the whole DIG on-chain line rides (chia-protocol 0.26).
+# The `chip-0035` feature gates the DataLayer/DataStore primitives (DataStore, DataStoreMetadata,
+# DataStoreInfo, DelegatedPuzzle, mint_datastore) — without it those types do not exist. We consume
+# the DataLayer primitive, the launcher, the standard p2 layer, the spend context, and the pure
+# signing calculator through it so the chia-* tree resolves to ONE coherent version set.
+chia-wallet-sdk = { version = "0.30", features = ["chip-0035"] }
+# Direct type deps, pinned to EXACTLY the versions chia-wallet-sdk 0.30 resolves to (a mismatch is a
+# hard cargo error). chia-protocol/chia-puzzle-types carry wire types the umbrella prelude does not
+# re-export (`Proof`, `LineageProof`); clvm-traits carries the CLVM (de)serialization traits.
+chia-protocol = "0.26"
+chia-puzzle-types = "0.26"
+clvm-traits = "0.26"
+# The crate error taxonomy (SPEC §6). thiserror 2 matches the sibling DIG crates.
+thiserror = "2"
+
+[dev-dependencies]
+# The in-process Chia Simulator + BLS keypair helpers for building real coin spends in tests.
+chia-sdk-test = "0.30"
+# Hex assertions on computed signature messages / coin ids in tests.
+hex = "0.4"
