@@ -15,7 +15,7 @@
 # foundation — their modules are declared as doc-only stubs so the layout is final.
 [package]
 name = "dig-merkle"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"

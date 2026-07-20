@@ -49,10 +49,13 @@ pub fn hydrate(parent_spend: &CoinSpend) -> MerkleResult<DataStore<DigDataStoreM
 mod tests {
     use super::*;
     use crate::melt::melt;
+    use crate::metadata::DigDataStoreMetadata;
     use crate::mint::mint_datastore;
     use crate::types::{Bytes32, Owner};
+    use chia_protocol::Bytes;
+    use chia_puzzle_types::singleton::LauncherSolution;
     use chia_puzzle_types::standard::StandardArgs;
-    use chia_wallet_sdk::driver::StandardLayer;
+    use chia_wallet_sdk::driver::{DlLauncherKvList, StandardLayer};
     use chia_wallet_sdk::test::Simulator;
 
     /// hydrate reconstructs a spendable store from a real launcher spend: the reconstructed store has
@@ -159,6 +162,80 @@ mod tests {
         assert!(
             matches!(hydrate(melt_spend), Err(MerkleError::MissingLineage)),
             "a terminal melt has no child to hydrate"
+        );
+        Ok(())
+    }
+
+    /// FAIL-CLOSED `MissingHint`: a launcher spend whose owner-discovery memos declare an ORACLE
+    /// delegated puzzle (hint byte `3`) but OMIT its trailing fee memo drives the SDK parser to
+    /// `DriverError::MissingMemo`, which `hydrate` maps to [`MerkleError::MissingHint`]. This is the
+    /// only test that reaches the `MissingHint` arm through the hydrate call itself (the other
+    /// `MissingHint` coverage is the error-display test); dig-merkle's own builders never emit a
+    /// malformed hint, so the branch is reachable only from an externally-supplied (attacker-shaped)
+    /// spend — exactly the fail-closed case `hydrate` exists to reject. A real launcher coin is reused
+    /// so the parser takes the launcher branch; only its solution memos are made malformed.
+    #[test]
+    fn hydrate_fails_closed_on_a_missing_oracle_fee_hint() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let owner = sim.bls(1_000_000);
+        let owner_ph: Bytes32 = StandardArgs::curry_tree_hash(owner.pk).into();
+
+        // Mint a real store just to obtain a genuine launcher coin (its puzzle hash IS the singleton
+        // launcher hash, so `from_spend` takes the launcher branch on our crafted spend).
+        let built = mint_datastore(
+            owner.coin,
+            Owner::Standard(owner.pk),
+            Bytes32::new([0x5a; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            vec![],
+            0,
+        )?;
+        let minted = built.child.expect("mint yields a child");
+        let launcher_spend = built
+            .coin_spends
+            .iter()
+            .find(|s| s.coin.coin_id() == minted.info.launcher_id)
+            .expect("launcher-coin spend present");
+
+        // A launcher solution whose key-value memos declare an oracle delegated puzzle (HintType 3)
+        // but stop before the required fee memo — `DelegatedPuzzle::from_memos` runs out of memos.
+        let oracle_ph = Bytes32::new([0x33; 32]);
+        let kv = DlLauncherKvList {
+            metadata: DigDataStoreMetadata {
+                root_hash: Bytes32::new([0x5a; 32]),
+                ..Default::default()
+            },
+            state_layer_inner_puzzle_hash: owner_ph,
+            memos: vec![
+                Bytes::from(owner_ph.to_vec()),
+                Bytes::new(vec![3u8]), // HintType::OraclePuzzle
+                Bytes::from(oracle_ph.to_vec()),
+                // NOTE: the oracle fee memo is deliberately absent → MissingMemo.
+            ],
+        };
+        let solution = LauncherSolution {
+            singleton_puzzle_hash: Bytes32::new([0x44; 32]),
+            amount: 1,
+            key_value_list: kv,
+        };
+
+        let mut ctx = SpendContext::new();
+        let solution_ptr = ctx.alloc(&solution)?;
+        let malformed_solution = ctx.serialize(&solution_ptr)?;
+        let crafted = CoinSpend::new(
+            launcher_spend.coin,
+            launcher_spend.puzzle_reveal.clone(),
+            malformed_solution,
+        );
+
+        assert!(
+            matches!(hydrate(&crafted), Err(MerkleError::MissingHint)),
+            "a launcher hint declaring an oracle puzzle without its fee fails closed to MissingHint"
         );
         Ok(())
     }

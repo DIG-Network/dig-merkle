@@ -88,9 +88,10 @@ mod tests {
     use super::*;
     use crate::mint::mint_datastore;
     use crate::required_signatures;
-    use crate::types::{Bytes32, DataStore};
+    use crate::types::{Bytes32, DataStore, DataStoreInfo, DelegatedPuzzle};
     use chia_puzzle_types::standard::StandardArgs;
-    use chia_wallet_sdk::prelude::MAINNET_CONSTANTS;
+    use chia_wallet_sdk::driver::{Layer, StandardLayer};
+    use chia_wallet_sdk::prelude::{TreeHash, MAINNET_CONSTANTS};
     use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature};
     use chia_wallet_sdk::test::Simulator;
 
@@ -149,6 +150,111 @@ mod tests {
         );
 
         sim.spend_coins(built.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
+        Ok(())
+    }
+
+    /// NON-VACUOUS owner preservation: the RECREATE `CREATE_COIN` actually targets the preserved
+    /// owner. `DataStore::from_spend` re-derives `child.info.owner_puzzle_hash` from the PARENT coin
+    /// (see the SDK: for an empty delegation set it uses the parent state-layer inner puzzle's tree
+    /// hash), so `update_round_trips_a_new_root`'s `owner preserved` assert would STILL pass if the
+    /// recreate had targeted an all-zero (or any wrong) owner. This pins the ACTUAL recreated coin's
+    /// puzzle hash — `child.coin.puzzle_hash`, which is derived from the emitted CREATE_COIN's
+    /// `puzzle_hash` — to the singleton puzzle for the ORIGINAL owner + the updated metadata, computed
+    /// independently of `child.info`. A wrong recreate owner changes the emitted CREATE_COIN puzzle
+    /// hash and FAILS this assert while leaving the parent-derived `info.owner_puzzle_hash` untouched.
+    #[test]
+    fn update_recreate_targets_the_original_owner_coin() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let (owner, store) = minted_store(&mut sim)?;
+
+        let new_metadata = DigDataStoreMetadata {
+            root_hash: Bytes32::new([0x77; 32]),
+            label: Some("site".into()),
+            ..Default::default()
+        };
+
+        let built = update_root(&store, Owner::Standard(owner.pk), new_metadata.clone())?;
+        let child = built.child.clone().expect("update yields a child");
+
+        // The expected recreated-coin puzzle hash, built INDEPENDENTLY from the ORIGINAL owner's real
+        // standard puzzle (`owner.pk`) + the new metadata — deliberately NOT from `child.info`, whose
+        // `owner_puzzle_hash` is parent-derived and thus insensitive to a wrong recreate target. The
+        // store is empty-delegated, so the correct recreated coin is the singleton over the NFT state
+        // layer over the owner's standard inner puzzle.
+        let mut ctx = SpendContext::new();
+        let expected_layers = DataStoreInfo::new(
+            store.info.launcher_id,
+            new_metadata,
+            store.info.owner_puzzle_hash,
+            vec![],
+        )
+        .into_layers_without_delegation_layer(StandardLayer::new(owner.pk));
+        let expected_puzzle = expected_layers.construct_puzzle(&mut ctx)?;
+        let expected_coin_ph: Bytes32 = ctx.tree_hash(expected_puzzle).into();
+
+        assert_eq!(
+            child.coin.puzzle_hash, expected_coin_ph,
+            "the recreate CREATE_COIN targets the preserved owner (a wrong owner would differ)"
+        );
+
+        // And the built spend still validates end to end.
+        sim.spend_coins(built.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
+        Ok(())
+    }
+
+    /// Delegation carry-forward: updating a DELEGATED store preserves its delegated-puzzle set. Every
+    /// other update test uses `delegated_puzzles: vec![]`, so none exercises the delegation path; here
+    /// the store is minted with a non-empty set (an admin + a writer authority) and the recreated
+    /// store MUST keep the same `delegated_puzzles`. Dropping or altering the set on recreate FAILS.
+    #[test]
+    fn update_preserves_the_delegation_set() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let owner = sim.bls(1_000_000);
+        let owner_ph: Bytes32 = StandardArgs::curry_tree_hash(owner.pk).into();
+
+        // A non-empty delegation set: an admin and a writer authority (arbitrary inner-puzzle hashes —
+        // the owner, not a delegated puzzle, authorizes this update, so the hashes need not be real
+        // spendable puzzles for the recreation to validate).
+        let delegated_puzzles = vec![
+            DelegatedPuzzle::Admin(TreeHash::new([0x11; 32])),
+            DelegatedPuzzle::Writer(TreeHash::new([0x22; 32])),
+        ];
+
+        let built = mint_datastore(
+            owner.coin,
+            Owner::Standard(owner.pk),
+            Bytes32::new([0x5a; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            delegated_puzzles.clone(),
+            0,
+        )?;
+        sim.spend_coins(built.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
+        let store = built.child.expect("mint yields a child");
+        assert_eq!(
+            store.info.delegated_puzzles, delegated_puzzles,
+            "the mint anchors the delegation set (test precondition)"
+        );
+
+        let updated = update_root(
+            &store,
+            Owner::Standard(owner.pk),
+            DigDataStoreMetadata {
+                root_hash: Bytes32::new([0x77; 32]),
+                ..Default::default()
+            },
+        )?;
+        let child = updated.child.expect("update yields a child");
+        assert_eq!(
+            child.info.delegated_puzzles, delegated_puzzles,
+            "the delegation set survives the update"
+        );
+
+        sim.spend_coins(updated.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
         Ok(())
     }
 
