@@ -114,9 +114,12 @@ The construction, byte-for-byte:
    launcher hint, which matches NO store already on chain. dig-merkle rewrites the launcher
    `CREATE_COIN` (the one to the singleton launcher puzzle hash
    `eff07522495060c066f66f32acc2a77e3a3e737aca8baea4d1a64ea4cdc13da9`) so its memos are EXACTLY
-   `[digstore_owner_hint(owner_puzzle_hash), DATASTORE_LAUNCHER_HINT]` (first = indexed owner
-   discovery hint, second = global launcher hint) — replicating chip35_dl_coin `store.rs` and
-   digstore-chain `singleton.rs`. This override is the DEFAULT behaviour, not opt-in.
+   `[digstore_owner_hint(owner_puzzle_hash), launcher_hint_for(kind)]` (first = indexed
+   kind-agnostic owner-discovery hint, second = the kind discriminator, §9) — replicating
+   chip35_dl_coin `store.rs` and digstore-chain `singleton.rs`. This override is the DEFAULT
+   behaviour, not opt-in. `mint_datastore` mints `StoreKind::File`, whose discriminator is the
+   unchanged `DATASTORE_LAUNCHER_HINT` — byte-identical to existing stores; `mint_datastore_with_kind`
+   selects a kind (#1263).
 3. Change above `fee + 1` mojos returns to `owner_puzzle_hash`, hinted. The `fee` is paid
    **implicitly** as (coins in − coins out) — there is NO explicit `RESERVE_FEE`, matching the
    on-chain producers. The `fee + 1` reservation is a CHECKED add: a `fee` so large that `fee + 1`
@@ -198,10 +201,9 @@ interface — a reference-DOWN pure leaf crate below dig-merkle, NOT a local tra
 synchronous method `coin_spend(coin_id: Bytes32) -> MerkleResult<Option<CoinSpend>>` (INV-1: the
 caller implements it over its own client; dig-merkle opens no socket).
 
-**Rollout.** The pure DID-detection helper `did_ref_from_spend` ships now. The `resolve_owner_did`
-lineage-walk wrapper lands when `dig-chainsource-interface` publishes to crates.io — dig-merkle
-publishes to crates.io and allows no `git` dependencies, so the interface dep (and the wrapper) are
-gated on that publish.
+Both layers ship: the pure DID-detection helper `did_ref_from_spend` and the `resolve_owner_did`
+lineage-walk wrapper over `dig_chainsource_interface::ChainSource` (`dig-chainsource-interface` on
+crates.io, a reference-DOWN pure leaf — no `git` dependency).
 
 ## 4. Signing boundary
 
@@ -309,11 +311,24 @@ backward-compatible:
   MUST match across every DIG consumer that resolves a DataLayer owner hint.
   `digstore_owner_hint(owner_ph) = sha256(DIGSTORE_OWNER_HINT_DOMAIN ‖ owner_ph)` — byte-identical to
   chip35_dl_coin + digstore-chain.
-- **Global launcher hint.** `DATASTORE_LAUNCHER_HINT = sha256("datastore") =
-  aa7e5b234e1d55967bf0a316395a2eab6cb3370332c0f251f0e44a5afb84fc68`, emitted as the second launcher
-  memo. Byte-identical across all DIG producers.
+- **Launcher-hint kind discriminator (`memo[1]`).** The second launcher memo names the store's
+  `StoreKind`:
+  - `StoreKind::File` → `DATASTORE_LAUNCHER_HINT = sha256("datastore") =
+    aa7e5b234e1d55967bf0a316395a2eab6cb3370332c0f251f0e44a5afb84fc68` — the pre-existing default,
+    byte-identical across all DIG producers (chip35_dl_coin, digstore-chain).
+  - `StoreKind::DidProfile` → `DID_PROFILE_LAUNCHER_HINT = sha256("dig:datastore:profile:v1") =
+    9c1d6b6d5d530dd613f4d7d2ced6b704ae8423377e4d567518493159c1d21d01` (#1263).
+
+  `launcher_hint_for(kind)` maps a kind to its discriminator (write side); `from_launcher_hint(memo)`
+  classifies a store by its `memo[1]` (read side), returning `None` for an unrecognised value. The
+  kind set is ADDITIVE (SPEC §8/§5.1): the `File` bytes never change, and a legacy store — every
+  store minted before #1263 — carries `DATASTORE_LAUNCHER_HINT` and so classifies as
+  `StoreKind::File`.
 - **Launcher memos.** A minted store's launcher `CREATE_COIN` carries exactly
-  `[digstore_owner_hint(owner_ph), DATASTORE_LAUNCHER_HINT]`, in that order.
+  `[digstore_owner_hint(owner_ph), launcher_hint_for(kind)]`, in that order — `memo[0]` is the
+  kind-agnostic owner hint, `memo[1]` is the kind discriminator. `mint_datastore` mints a
+  `StoreKind::File` store (byte-identical to existing on-chain stores); `mint_datastore_with_kind`
+  selects the kind.
 - **Root metadata shape.** `root_hash` is the first atom of the metadata CLVM
   `(root_hash . optional-kv-pairs)`; optional keys are `l`/`d`/`sp`/`p`/`sz` (dig-merkle never emits
   `"b"`). `p` (program_hash) is appended after `sp`, then `sz` (size_bucket) is ALWAYS appended LAST —
@@ -329,7 +344,7 @@ backward-compatible:
   the SDK's `"b"`, and yields `size_bucket == None` / `program_hash == None`.
 - **Dependency layer.** dig-merkle depends ONLY on `chia-wallet-sdk` +
   `chia-protocol`/`chia-puzzle-types`/`clvm-traits`/`chia-sha2` + external utility crates
-  (thiserror, hex-literal), plus — once it publishes to crates.io — the single canonical leaf
-  `dig-chainsource-interface` (the `ChainSource` read interface consumed by §3.7; a reference-DOWN
-  pure leaf BELOW dig-merkle). It MUST NOT depend on any other `dig-*` crate, and MUST NEVER depend on
+  (thiserror, hex-literal), plus the single canonical leaf `dig-chainsource-interface` (the
+  `ChainSource` read interface consumed by §3.7; a reference-DOWN pure leaf BELOW dig-merkle,
+  crates.io-published). It MUST NOT depend on any other `dig-*` crate, and MUST NEVER depend on
   `dig-identity` (the edge is one-way, dig-identity → dig-merkle — the reverse is a cycle).
