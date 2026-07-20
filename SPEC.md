@@ -225,13 +225,22 @@ build MerkleCoinSpend -> required_signatures(&spend.coin_spends, &constants)
 
 To spend an existing DataLayer coin, a caller reconstructs a spendable `DataStore` from its parent
 coin spend (`DataStore::from_spend`) and the `LineageProof` a singleton child requires
-(`DataStore::child_lineage_proof`). Hydration is **fail-closed**:
+(`child_lineage_proof`). Hydration is **fail-closed**:
 
 - A coin whose puzzle does not parse as a DataLayer singleton yields `MerkleError::NotDataStore`.
 - A missing lineage proof yields `MerkleError::MissingLineage` — dig-merkle never fabricates one.
 - A missing required hint memo yields `MerkleError::MissingHint`.
 
 dig-merkle never guesses missing chain state; the caller supplies the real parent spend.
+
+**Child lineage proof — the DataLayer updater path (INV-4).** `child_lineage_proof` derives the
+`parent_inner_puzzle_hash` a child singleton must attest to by reconstructing the store's NFT-state-
+layer tree hash the SAME way a real on-chain DataLayer coin is built: currying
+`DL_METADATA_UPDATER_PUZZLE_HASH` (the DataLayer metadata updater), NOT the NFT-default updater that
+the SDK's generic `DataStoreInfo::inner_puzzle_hash` currys. The inner puzzle under the state layer is
+the delegation layer when the store carries admin/writer/oracle delegated puzzles, else the bare owner
+puzzle hash. Deriving it any other way yields a `parent_inner_puzzle_hash` that a child spend fails
+consensus against (`AssertMyParentIdFailed`).
 
 **Launcher-lineage discovery (§3.7).** Owner-DID discovery is the same fail-closed principle applied
 to a READ: `resolve_owner_did` walks the launcher lineage via the injected `ChainSource`
