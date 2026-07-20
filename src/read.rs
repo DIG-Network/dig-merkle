@@ -117,10 +117,34 @@ pub fn resolve_owner_did<C: ChainSource>(
         return Ok(None);
     };
 
+    // Fail-closed identity binding (NC-9): a DIG store id IS its launcher coin id (read.rs docstring
+    // step 1). The injected ChainSource is only trusted to return CONFIRMED spends, never to return
+    // the RIGHT coin — a hostile/buggy source (e.g. the attacker-influenceable public gateway, §5.3)
+    // can answer this read with a DIFFERENT store's valid, DID-rooted launcher. Without this check the
+    // walk would attribute that other store's owning DID to `store_id`. Reject with an error (not
+    // Ok(None)) so a substituted answer is distinguishable from a genuinely non-DID-owned store.
+    if launcher_spend.coin.coin_id() != store_id {
+        return Err(MerkleError::Chain(format!(
+            "launcher spend for {store_id} is coin {}, not the requested store's launcher",
+            launcher_spend.coin.coin_id()
+        )));
+    }
+
     let parent_id = launcher_spend.coin.parent_coin_info;
     let Some(creator_spend) = read_coin_spend(chain, parent_id)? else {
         return Ok(None);
     };
+
+    // Fail-closed identity binding (NC-9) for the second hop: the creator spend fetched under
+    // `parent_id` must actually BE the coin that created the launcher. As above, a source could return
+    // an unrelated DID spend under this id; without binding it to `parent_id` the walk would recognise
+    // a DID that never authorized this store.
+    if creator_spend.coin.coin_id() != parent_id {
+        return Err(MerkleError::Chain(format!(
+            "creator spend for {parent_id} is coin {}, not the launcher's parent",
+            creator_spend.coin.coin_id()
+        )));
+    }
 
     did_ref_from_spend(&creator_spend)
 }
@@ -242,8 +266,10 @@ mod tests {
         let did_coin_id = did_spend.coin.coin_id();
 
         // The store's launcher coin was created by spending the DID coin: its parent IS the DID coin.
-        let store_id = Bytes32::new([0xa1; 32]);
+        // A DIG store id IS its launcher coin id, so derive it from the launcher coin (the binding
+        // the walk now enforces).
         let launcher_coin = Coin::new(did_coin_id, Bytes32::new([0xb2; 32]), 1);
+        let store_id = launcher_coin.coin_id();
         // Only `launcher_spend.coin.parent_coin_info` is read by the walk; reuse a real program pair.
         let launcher_spend = CoinSpend::new(
             launcher_coin,
@@ -283,8 +309,9 @@ mod tests {
             .find(|s| s.coin.coin_id() == alice.coin.coin_id())
             .expect("standard creator spend present");
 
-        let store_id = Bytes32::new([0xc3; 32]);
+        // A DIG store id IS its launcher coin id (the binding the walk enforces).
         let launcher_coin = Coin::new(alice.coin.coin_id(), Bytes32::new([0xd4; 32]), 1);
+        let store_id = launcher_coin.coin_id();
         let launcher_spend = CoinSpend::new(
             launcher_coin,
             creator_spend.puzzle_reveal.clone(),
@@ -318,12 +345,13 @@ mod tests {
     /// A missing CREATOR spend (launcher present, its parent unknown) also fails closed to `Ok(None)`.
     #[test]
     fn resolve_owner_did_none_when_creator_spend_missing() -> anyhow::Result<()> {
-        let store_id = Bytes32::new([0x1a; 32]);
         let parent_id = Bytes32::new([0x2b; 32]);
-        // A launcher spend whose creator (parent) is not in the source.
+        // A launcher spend whose creator (parent) is not in the source. A DIG store id IS its
+        // launcher coin id (the binding the walk enforces).
         let mut sim = Simulator::new();
         let (any_spend, _) = did_coin_and_spend(&mut sim)?;
         let launcher_coin = Coin::new(parent_id, Bytes32::new([0x3c; 32]), 1);
+        let store_id = launcher_coin.coin_id();
         let launcher_spend = CoinSpend::new(
             launcher_coin,
             any_spend.puzzle_reveal.clone(),
@@ -332,6 +360,84 @@ mod tests {
 
         let chain = MockChainSource::new().with_spend(store_id, launcher_spend);
         assert_eq!(resolve_owner_did(store_id, &chain)?, None);
+        Ok(())
+    }
+
+    /// A SUBSTITUTED launcher — the source answers `store_id` with a DIFFERENT store's valid,
+    /// DID-rooted launcher — fails closed to `Err(MerkleError::Chain)`, NOT the wrong DID and NOT
+    /// `Ok(None)`. Without the `launcher_spend.coin.coin_id() == store_id` binding this returns
+    /// `Ok(Some(other_did))` and mis-attributes ownership (NC-9, §5.3).
+    #[test]
+    fn resolve_owner_did_rejects_a_substituted_launcher() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let (did_spend, _did_launcher_id) = did_coin_and_spend(&mut sim)?;
+        let did_coin_id = did_spend.coin.coin_id();
+
+        // A genuine, DID-rooted launcher for store B (its coin_id is store B's real id).
+        let launcher_coin = Coin::new(did_coin_id, Bytes32::new([0xb2; 32]), 1);
+        let store_b_id = launcher_coin.coin_id();
+        let launcher_spend = CoinSpend::new(
+            launcher_coin,
+            did_spend.puzzle_reveal.clone(),
+            did_spend.solution.clone(),
+        );
+
+        // The caller asks for store A, but the source returns store B's launcher under A's id.
+        let store_a_id = Bytes32::new([0xa1; 32]);
+        assert_ne!(
+            store_a_id, store_b_id,
+            "the requested id differs from the answer's coin id"
+        );
+        let chain = MockChainSource::new()
+            .with_spend(store_a_id, launcher_spend)
+            .with_spend(did_coin_id, did_spend);
+
+        assert!(
+            matches!(
+                resolve_owner_did(store_a_id, &chain),
+                Err(MerkleError::Chain(_))
+            ),
+            "a substituted launcher is rejected, not attributed to the other store's DID"
+        );
+        Ok(())
+    }
+
+    /// A WRONG creator — the launcher is genuine, but the source answers `parent_id` with a spend of
+    /// a coin whose `coin_id() != parent_id` — fails closed to `Err(MerkleError::Chain)`. Without the
+    /// `creator_spend.coin.coin_id() == parent_id` binding this recognises a DID that never authorized
+    /// the store (NC-9).
+    #[test]
+    fn resolve_owner_did_rejects_a_wrong_creator() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let (did_spend, _did_launcher_id) = did_coin_and_spend(&mut sim)?;
+        let did_coin_id = did_spend.coin.coin_id();
+
+        // The launcher's parent is a fabricated id that is NOT the DID coin's id.
+        let fake_parent_id = Bytes32::new([0x7f; 32]);
+        assert_ne!(
+            fake_parent_id, did_coin_id,
+            "the parent id is not the DID coin's id"
+        );
+        let launcher_coin = Coin::new(fake_parent_id, Bytes32::new([0xb2; 32]), 1);
+        let store_id = launcher_coin.coin_id();
+        let launcher_spend = CoinSpend::new(
+            launcher_coin,
+            did_spend.puzzle_reveal.clone(),
+            did_spend.solution.clone(),
+        );
+
+        // The source returns the real DID spend (coin_id == did_coin_id) under the fake parent id.
+        let chain = MockChainSource::new()
+            .with_spend(store_id, launcher_spend)
+            .with_spend(fake_parent_id, did_spend);
+
+        assert!(
+            matches!(
+                resolve_owner_did(store_id, &chain),
+                Err(MerkleError::Chain(_))
+            ),
+            "a creator spend not bound to the launcher's parent is rejected"
+        );
         Ok(())
     }
 
