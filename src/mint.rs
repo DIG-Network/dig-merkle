@@ -3,8 +3,8 @@
 //! [`mint_datastore`] builds the unsigned coin spends that launch a fresh CHIP-0035 DataLayer
 //! singleton whose `launcher_id` becomes the DIG `store_id`. It funds the launcher from a caller-
 //! supplied `parent_coin`, curries the store's [`DigDataStoreMetadata`] (the anchored merkle
-//! `root_hash` plus optional label/description/bytes/size-proof/program-hash) and delegated-puzzle
-//! set, and — the
+//! `root_hash` plus optional label/description/size-proof/program-hash/size-bucket) and
+//! delegated-puzzle set, and — the
 //! load-bearing detail — overrides the launcher `CREATE_COIN` memos to the two-memo owner-discovery
 //! hint so a minted store is byte-identical to the stores chip35_dl_coin and digstore-chain already
 //! publish on-chain (SPEC §9).
@@ -77,7 +77,6 @@ pub fn mint_datastore(
     root_hash: Bytes32,
     label: Option<String>,
     description: Option<String>,
-    bytes: Option<u64>,
     size_proof: Option<String>,
     program_hash: Option<Bytes32>,
     size_bucket: Option<SizeBucket>,
@@ -95,7 +94,6 @@ pub fn mint_datastore(
             root_hash,
             label,
             description,
-            bytes,
             size_proof,
             program_hash,
             size_bucket,
@@ -241,7 +239,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             owner_ph,
             vec![],
             1_000,
@@ -267,7 +264,6 @@ mod tests {
             root_hash: root,
             label: Some("site".into()),
             description: Some("desc".into()),
-            bytes: Some(42),
             size_proof: None,
             program_hash: None,
             size_bucket: None,
@@ -292,7 +288,6 @@ mod tests {
             Owner::Standard(owner.pk),
             root,
             Some("site".into()),
-            None,
             None,
             None,
             None,
@@ -340,7 +335,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             owner_ph,
             vec![],
             1_000,
@@ -373,7 +367,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             owner_ph,
             vec![],
             0,
@@ -398,7 +391,8 @@ mod tests {
     }
 
     /// Builds the same coin spends `mint_datastore` does but currying the SDK's `DataStoreMetadata`
-    /// (no `program_hash`), so a byte-identity comparison isolates JUST the metadata type swap.
+    /// (with `bytes == None`, since dig-merkle never emits `"b"`), so a byte-identity comparison
+    /// isolates JUST the metadata type swap.
     #[allow(clippy::too_many_arguments)]
     fn reference_sdk_mint(
         parent_coin: Coin,
@@ -406,7 +400,6 @@ mod tests {
         root: Bytes32,
         label: Option<String>,
         description: Option<String>,
-        bytes: Option<u64>,
         size_proof: Option<String>,
         owner_puzzle_hash: Bytes32,
         fee: u64,
@@ -421,7 +414,7 @@ mod tests {
                     root_hash: root,
                     label,
                     description,
-                    bytes,
+                    bytes: None,
                     size_proof,
                 },
                 owner_puzzle_hash.into(),
@@ -466,7 +459,6 @@ mod tests {
             root,
             Some("store".into()),
             None,
-            Some(10),
             None,
             None,
             None,
@@ -482,7 +474,6 @@ mod tests {
             root,
             Some("store".into()),
             None,
-            Some(10),
             None,
             owner_ph,
             1_000,
@@ -490,7 +481,7 @@ mod tests {
 
         assert_eq!(
             dig.coin_spends, reference,
-            "a None-program_hash mint must be byte-identical to an SDK-metadata mint"
+            "a None-extras mint must be byte-identical to an SDK-metadata mint"
         );
     }
 
@@ -508,7 +499,6 @@ mod tests {
             owner.coin,
             Owner::Standard(owner.pk),
             root,
-            None,
             None,
             None,
             None,
@@ -559,7 +549,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Some(size_bucket),
             owner_ph,
             vec![],
@@ -599,7 +588,6 @@ mod tests {
             parent,
             Owner::Standard(owner_pk),
             Bytes32::new([0x03; 32]),
-            None,
             None,
             None,
             None,
