@@ -25,6 +25,8 @@ use chia_protocol::Bytes32;
 use chia_wallet_sdk::driver::MetadataWithRootHash;
 use clvm_traits::{ClvmDecoder, ClvmEncoder, FromClvm, FromClvmError, Raw, ToClvm, ToClvmError};
 
+use crate::size::SizeBucket;
+
 /// The DIG DataLayer metadata: the canonical `DataStoreMetadata` fields plus an additive
 /// `program_hash`.
 ///
@@ -49,8 +51,13 @@ pub struct DigDataStoreMetadata {
     pub size_proof: Option<String>,
 
     /// The optional CLVM tree-hash of the program/puzzle this store is associated with (CLVM alist
-    /// key `"p"`, appended LAST). dig-merkle stores and echoes this value; it never computes it.
+    /// key `"p"`, appended after `"sp"`). dig-merkle stores and echoes this value; it never computes it.
     pub program_hash: Option<Bytes32>,
+
+    /// The optional `.dig` store size as a power-of-2 bucket (CLVM alist key `"sz"`, appended LAST —
+    /// after `"p"`). Encoded on-wire as the minimal 1-byte bucket exponent `k ∈ 0..=10` (empty atom
+    /// for `k = 0`), so a `None` size is byte-identical to a store without the key. See [`SizeBucket`].
+    pub size_bucket: Option<SizeBucket>,
 }
 
 /// Encodes `(root_hash . items)` where `items` pushes `l`/`d`/`b`/`sp` (mirroring the SDK exactly),
@@ -78,10 +85,16 @@ impl<N, E: ClvmEncoder<Node = N>> ToClvm<E> for DigDataStoreMetadata {
             items.push(("sp", Raw(size_proof.to_clvm(encoder)?)));
         }
 
-        // The one DIG addition: appended last, omitted when None → byte-identical to the SDK's
-        // metadata for an ordinary store (SPEC §8/§9).
+        // The DIG additions, appended after the SDK keys and each omitted when None → byte-identical
+        // to the SDK's metadata for an ordinary store (SPEC §8/§9).
         if let Some(program_hash) = self.program_hash {
             items.push(("p", Raw(program_hash.to_clvm(encoder)?)));
+        }
+
+        // The size bucket is appended LAST, its exponent (0..=10) encoded as a minimal CLVM integer
+        // (NC-8): the empty atom for k=0, a single byte for k=1..=10.
+        if let Some(size_bucket) = self.size_bucket {
+            items.push(("sz", Raw(size_bucket.exponent().to_clvm(encoder)?)));
         }
 
         (self.root_hash, items).to_clvm(encoder)
@@ -103,6 +116,7 @@ impl<N, D: ClvmDecoder<Node = N>> FromClvm<D> for DigDataStoreMetadata {
                 "b" => metadata.bytes = Some(u64::from_clvm(decoder, ptr)?),
                 "sp" => metadata.size_proof = Some(String::from_clvm(decoder, ptr)?),
                 "p" => metadata.program_hash = Some(Bytes32::from_clvm(decoder, ptr)?),
+                "sz" => metadata.size_bucket = Some(decode_size_bucket(decoder, ptr)?),
                 _ => (),
             }
         }
@@ -111,8 +125,30 @@ impl<N, D: ClvmDecoder<Node = N>> FromClvm<D> for DigDataStoreMetadata {
     }
 }
 
+/// Decodes a `"sz"` value into a [`SizeBucket`], enforcing the CANONICAL minimal encoding (NC-8) and
+/// failing CLOSED on anything else: the empty atom is `k = 0`, a single byte `1..=10` is that `k`,
+/// and a non-minimal (leading-zero) atom, a byte `> 10`, or a multi-byte atom is REJECTED. This is
+/// what makes the on-wire size a canonical form no producer can encode two ways.
+fn decode_size_bucket<N, D: ClvmDecoder<Node = N>>(
+    decoder: &D,
+    ptr: N,
+) -> Result<SizeBucket, FromClvmError> {
+    const INVALID_SZ: &str = "invalid sz: non-minimal or out-of-range size exponent";
+
+    let atom = decoder.decode_atom(&ptr)?;
+    let exponent = match atom.as_ref() {
+        [] => 0u8,
+        [byte] if (1..=10).contains(byte) => *byte,
+        _ => return Err(FromClvmError::Custom(INVALID_SZ.to_string())),
+    };
+
+    // The exponent is already validated to 0..=10 above, so this cannot fail; map defensively rather
+    // than unwrap so an invariant change surfaces as an error, never a panic.
+    SizeBucket::from_exponent(exponent).map_err(|error| FromClvmError::Custom(error.to_string()))
+}
+
 /// The SDK's generic `build_datastore`/`from_spend` require this bound to recover the anchored root.
-/// `root_hash_only` clears every optional field — including `program_hash` — to `None`.
+/// `root_hash_only` clears every optional field — including `program_hash` and `size_bucket` — to `None`.
 impl MetadataWithRootHash for DigDataStoreMetadata {
     fn root_hash(&self) -> Bytes32 {
         self.root_hash
@@ -126,6 +162,7 @@ impl MetadataWithRootHash for DigDataStoreMetadata {
             bytes: None,
             size_proof: None,
             program_hash: None,
+            size_bucket: None,
         }
     }
 }
@@ -175,6 +212,7 @@ mod tests {
             bytes,
             size_proof: size_proof.clone(),
             program_hash: None,
+            size_bucket: None,
         };
         let sdk = DataStoreMetadata {
             root_hash: root,
@@ -205,6 +243,7 @@ mod tests {
             bytes,
             size_proof,
             program_hash,
+            size_bucket: None,
         };
 
         let mut ctx = SpendContext::new();
@@ -225,6 +264,7 @@ mod tests {
             bytes: None,
             size_proof: Some("sp".into()),
             program_hash: Some(Bytes32::new([0x01; 32])),
+            size_bucket: None,
         };
 
         let mut ctx = SpendContext::new();
@@ -265,6 +305,7 @@ mod tests {
             decoded.program_hash, None,
             "an old store has no program_hash"
         );
+        assert_eq!(decoded.size_bucket, None, "an old store has no size_bucket");
     }
 
     /// An SDK-typed reader decoding a `program_hash`-bearing store succeeds and simply DROPS the
@@ -279,6 +320,7 @@ mod tests {
             bytes,
             size_proof: size_proof.clone(),
             program_hash: Some(Bytes32::new([0x9a; 32])),
+            size_bucket: None,
         };
 
         let mut ctx = SpendContext::new();
@@ -290,5 +332,213 @@ mod tests {
         assert_eq!(sdk.description, description);
         assert_eq!(sdk.bytes, bytes);
         assert_eq!(sdk.size_proof, size_proof);
+    }
+
+    /// The exact raw atom bytes of the `"sz"` value in an encoded metadata, for on-wire assertions.
+    fn sz_atom_bytes(metadata: &DigDataStoreMetadata) -> Vec<u8> {
+        let mut ctx = SpendContext::new();
+        let node = metadata.to_clvm(&mut *ctx).expect("encode");
+        let (_root, items) =
+            <(Bytes32, Vec<(String, Raw<NodePtr>)>)>::from_clvm(&*ctx, node).expect("decode alist");
+        let (_key, Raw(ptr)) = items
+            .into_iter()
+            .find(|(k, _)| k == "sz")
+            .expect("sz key present");
+        chia_protocol::Bytes::from_clvm(&*ctx, ptr)
+            .expect("sz atom")
+            .into_inner()
+    }
+
+    /// With BOTH `size_bucket` and `program_hash` `None`, the CLVM bytes are IDENTICAL to the SDK's
+    /// `DataStoreMetadata` — adding the `"sz"` field changes nothing when absent (SPEC §5.1).
+    #[test]
+    fn metadata_none_sz_is_byte_identical_to_sdk() {
+        let (root, label, description, bytes, size_proof) = sample_fields();
+        let dig = DigDataStoreMetadata {
+            root_hash: root,
+            label: label.clone(),
+            description: description.clone(),
+            bytes,
+            size_proof: size_proof.clone(),
+            program_hash: None,
+            size_bucket: None,
+        };
+        let sdk = DataStoreMetadata {
+            root_hash: root,
+            label,
+            description,
+            bytes,
+            size_proof,
+        };
+        assert_eq!(clvm_bytes(&dig), clvm_bytes(&sdk));
+    }
+
+    /// With `size_bucket == None` but `program_hash == Some`, the bytes equal the v0.2.0 p-bearing
+    /// encoding — proving the new field is invisible on the wire when absent.
+    #[test]
+    fn sz_absent_leaves_p_encoding_unchanged() {
+        let (root, label, description, bytes, size_proof) = sample_fields();
+        let program_hash = Bytes32::new([0x7e; 32]);
+
+        let with_sz_field = DigDataStoreMetadata {
+            root_hash: root,
+            label: label.clone(),
+            description: description.clone(),
+            bytes,
+            size_proof: size_proof.clone(),
+            program_hash: Some(program_hash),
+            size_bucket: None,
+        };
+        // The v0.2.0 encoding is exactly the (root, alist) with l/d/b/sp/p and no sz — reconstruct it
+        // and compare byte-for-byte.
+        let mut ctx = SpendContext::new();
+        let items: Vec<(&str, Raw<NodePtr>)> = vec![
+            ("l", Raw(label.to_clvm(&mut *ctx).unwrap())),
+            ("d", Raw(description.to_clvm(&mut *ctx).unwrap())),
+            ("b", Raw(bytes.to_clvm(&mut *ctx).unwrap())),
+            ("sp", Raw(size_proof.to_clvm(&mut *ctx).unwrap())),
+            ("p", Raw(program_hash.to_clvm(&mut *ctx).unwrap())),
+        ];
+        let legacy_node = (root, items).to_clvm(&mut *ctx).unwrap();
+        let legacy_bytes = chia_protocol::Program::from_clvm(&*ctx, legacy_node)
+            .unwrap()
+            .as_ref()
+            .to_vec();
+
+        assert_eq!(clvm_bytes(&with_sz_field), legacy_bytes);
+    }
+
+    /// A v0.2.0/SDK (sz-free) store decodes with `size_bucket == None`, all other fields preserved.
+    #[test]
+    fn old_metadata_without_sz_decodes_losslessly() {
+        let (root, label, description, bytes, size_proof) = sample_fields();
+        let sdk = DataStoreMetadata {
+            root_hash: root,
+            label: label.clone(),
+            description: description.clone(),
+            bytes,
+            size_proof: size_proof.clone(),
+        };
+        let mut ctx = SpendContext::new();
+        let node = sdk.to_clvm(&mut *ctx).expect("encode sdk");
+        let decoded = DigDataStoreMetadata::from_clvm(&*ctx, node).expect("decode as dig");
+
+        assert_eq!(decoded.size_bucket, None);
+        assert_eq!(decoded.label, label);
+        assert_eq!(decoded.size_proof, size_proof);
+    }
+
+    /// An sz-bearing store decoded by the SDK's `DataStoreMetadata` succeeds, ignoring `"sz"`.
+    #[test]
+    fn sdk_reader_ignores_sz() {
+        let (root, label, description, bytes, size_proof) = sample_fields();
+        let dig = DigDataStoreMetadata {
+            root_hash: root,
+            label: label.clone(),
+            description: description.clone(),
+            bytes,
+            size_proof: size_proof.clone(),
+            program_hash: None,
+            size_bucket: Some(SizeBucket::from_exponent(5).unwrap()),
+        };
+        let mut ctx = SpendContext::new();
+        let node = dig.to_clvm(&mut *ctx).expect("encode dig");
+        let sdk = DataStoreMetadata::from_clvm(&*ctx, node).expect("sdk decodes, ignoring sz");
+
+        assert_eq!(sdk.root_hash, root);
+        assert_eq!(sdk.label, label);
+        assert_eq!(sdk.size_proof, size_proof);
+    }
+
+    /// A `Some(SizeBucket)` encodes then decodes unchanged, with every other field preserved.
+    #[test]
+    fn sz_roundtrips() {
+        let (root, label, description, bytes, size_proof) = sample_fields();
+        let metadata = DigDataStoreMetadata {
+            root_hash: root,
+            label,
+            description,
+            bytes,
+            size_proof,
+            program_hash: Some(Bytes32::new([0x11; 32])),
+            size_bucket: Some(SizeBucket::from_exponent(7).unwrap()),
+        };
+        let mut ctx = SpendContext::new();
+        let node = metadata.to_clvm(&mut *ctx).expect("encode");
+        let decoded = DigDataStoreMetadata::from_clvm(&*ctx, node).expect("decode");
+        assert_eq!(decoded, metadata);
+    }
+
+    /// With l/sp/p/sz all set, `"sz"` is the LAST alist key — appended after `"p"`.
+    #[test]
+    fn sz_is_last_alist_key() {
+        let metadata = DigDataStoreMetadata {
+            root_hash: Bytes32::new([0xab; 32]),
+            label: Some("l".into()),
+            description: None,
+            bytes: None,
+            size_proof: Some("sp".into()),
+            program_hash: Some(Bytes32::new([0x01; 32])),
+            size_bucket: Some(SizeBucket::from_exponent(3).unwrap()),
+        };
+        let mut ctx = SpendContext::new();
+        let node = metadata.to_clvm(&mut *ctx).expect("encode");
+        let (_root, items) =
+            <(Bytes32, Vec<(String, Raw<NodePtr>)>)>::from_clvm(&*ctx, node).expect("decode");
+        let keys: Vec<&str> = items.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["l", "sp", "p", "sz"], "sz is appended last");
+    }
+
+    /// The on-wire `"sz"` atom is minimally encoded (NC-8): empty atom for k=0, a single byte
+    /// otherwise. Pins the exact bytes for k=0/5/10.
+    #[test]
+    fn sz_atom_is_minimally_encoded() {
+        let with_k = |k: u8| DigDataStoreMetadata {
+            root_hash: Bytes32::new([0x01; 32]),
+            label: None,
+            description: None,
+            bytes: None,
+            size_proof: None,
+            program_hash: None,
+            size_bucket: Some(SizeBucket::from_exponent(k).unwrap()),
+        };
+        assert_eq!(
+            sz_atom_bytes(&with_k(0)),
+            Vec::<u8>::new(),
+            "k=0 empty atom"
+        );
+        assert_eq!(sz_atom_bytes(&with_k(5)), vec![0x05], "k=5 single byte");
+        assert_eq!(sz_atom_bytes(&with_k(10)), vec![0x0a], "k=10 single byte");
+    }
+
+    /// Fail-closed decode: a `"sz"` atom that is non-minimal (`[0x00]`, `[0x00,0x05]`) or out of range
+    /// (`[0x0b]` == 11) is REJECTED. Also `SizeBucket::from_exponent(11)` errors.
+    #[test]
+    fn sz_decode_rejects_non_minimal_and_oversized() {
+        let build_with_raw_sz = |raw: Vec<u8>| -> Result<DigDataStoreMetadata, FromClvmError> {
+            let mut ctx = SpendContext::new();
+            let root = Bytes32::new([0x01; 32]);
+            let sz_node = chia_protocol::Bytes::new(raw).to_clvm(&mut *ctx).unwrap();
+            let items: Vec<(&str, Raw<NodePtr>)> = vec![("sz", Raw(sz_node))];
+            let node = (root, items).to_clvm(&mut *ctx).unwrap();
+            DigDataStoreMetadata::from_clvm(&*ctx, node)
+        };
+
+        assert!(
+            build_with_raw_sz(vec![0x00]).is_err(),
+            "leading-zero rejected"
+        );
+        assert!(
+            build_with_raw_sz(vec![0x00, 0x05]).is_err(),
+            "multi-byte non-minimal rejected"
+        );
+        assert!(
+            build_with_raw_sz(vec![0x0b]).is_err(),
+            "exponent 11 rejected"
+        );
+        assert!(matches!(
+            SizeBucket::from_exponent(11),
+            Err(crate::MerkleError::InvalidSize(_))
+        ));
     }
 }

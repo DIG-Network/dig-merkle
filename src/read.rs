@@ -45,6 +45,15 @@ pub struct DidRef {
 /// them to the SDK's [`Did::parse`] (the byte-source-of-truth, INV-4). It performs NO network I/O and
 /// never signs or spends — it only inspects the given bytes.
 ///
+/// # Authoritative ONLY for a CONFIRMED on-chain spend (NC-9)
+///
+/// This function trusts its input and only recognises STRUCTURE; it does NOT verify that the spend
+/// happened on chain. A caller feeding an unconfirmed, attacker-shaped, or otherwise unverified spend
+/// can be made to mis-attribute ownership — a crafted puzzle that parses as a DID yields a `Some`
+/// that proves nothing. Genuine chain-proven attribution MUST fetch the store launcher's parent spend
+/// from a TRUSTED chain source and verify it was actually spent on chain before trusting the result.
+/// Do NOT treat a `Some` result from an unverified spend as proof of ownership.
+///
 /// # Errors
 ///
 /// Returns [`MerkleError::Parse`] if the spend's puzzle/solution CLVM cannot be allocated, or

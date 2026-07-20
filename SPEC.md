@@ -35,22 +35,38 @@ metadata updater). Its structure:
 - **`launcher_id == store_id`.** The singleton launcher coin id IS the DIG `store_id`. It is
   permanent and uniquely names the store for the coin's entire lineage.
 - **`DigDataStoreMetadata`** carries the anchored state. It is a strict, backwards-compatible
-  SUPERSET of the SDK's `DataStoreMetadata` — every SDK field plus one additive `program_hash`:
+  SUPERSET of the SDK's `DataStoreMetadata` — every SDK field plus the additive `program_hash` and
+  `size_bucket`:
   - `root_hash: Bytes32` — the `.dig` capsule's merkle root (the anchored value). REQUIRED; first atom.
   - `label: Option<String>`, `description: Option<String>` — human metadata (CLVM keys `l`, `d`).
   - `bytes: Option<u64>` — the store size in bytes (CLVM key `b`).
   - `size_proof: Option<String>` — an optional size attestation (CLVM key `sp`).
   - `program_hash: Option<Bytes32>` — the CLVM tree-hash of the program/puzzle associated with the
-    store/capsule (CLVM key `p`, appended LAST, only when `Some`). dig-merkle STORES and ECHOES it
-    only — it never computes it (producers compute it via `clvm_utils::tree_hash`/`ToTreeHash`).
+    store/capsule (CLVM key `p`, appended after `sp`, only when `Some`). dig-merkle STORES and ECHOES
+    it only — it never computes it (producers compute it via `clvm_utils::tree_hash`/`ToTreeHash`).
+  - `size_bucket: Option<SizeBucket>` — the store's size as a power-of-2 bucket (CLVM key `sz`,
+    appended LAST, only when `Some`). A `SizeBucket` is a validated exponent `k ∈ 0..=10` mapping to
+    `2^k MB`, where **1 MB = 1 MiB = 2^20 bytes** — so the ladder is 1 MB (k=0) … 1024 MB = 1 GB
+    (k=10). On the wire the value is the exponent encoded as a MINIMAL CLVM integer (NC-8): the empty
+    atom for `k=0`, a single byte `0x01`..`0x0a` for `k=1`..`10`. `SizeBucket::for_byte_len(bytes)`
+    is the CANONICAL byte→bucket mapping (the smallest `k` with `2^(k+20) ≥ bytes`; 0/1 byte → k=0,
+    exactly 1 GiB → k=10, `> 2^30` → error) so dig-store never re-derives the ladder and drifts. The
+    `sz` bucket is a coarse pre-download SIZE PROOF/class; it COEXISTS with the exact `bytes`/`b`
+    field and does NOT replace it.
 
-  **INV-4 byte-identity reconciliation.** `program_hash` is a pure ADDITION that never breaks INV-4
-  byte-agreement: with `program_hash == None` the CLVM encoding is IDENTICAL to the SDK's
-  `DataStoreMetadata` (the `p` key is omitted), so an ordinary DIG store is byte-for-byte a plain
-  DataLayer store. `DigDataStoreMetadata` and the SDK's `DataStoreMetadata` are mutually equivalent
-  for the shared keys (`root_hash`/`l`/`d`/`b`/`sp`): an SDK-typed reader decoding a `p`-bearing store
-  ignores the unknown key, and a `DigDataStoreMetadata` reader decoding a `p`-free store yields
-  `program_hash == None`.
+  **INV-4 byte-identity reconciliation.** `program_hash` and `size_bucket` are pure ADDITIONS that
+  never break INV-4 byte-agreement: with BOTH `None` the CLVM encoding is IDENTICAL to the SDK's
+  `DataStoreMetadata` (the `p` and `sz` keys are omitted), so an ordinary DIG store is byte-for-byte a
+  plain DataLayer store. `DigDataStoreMetadata` and the SDK's `DataStoreMetadata` are mutually
+  equivalent for the shared keys (`root_hash`/`l`/`d`/`b`/`sp`): an SDK-typed reader decoding a
+  `p`/`sz`-bearing store ignores the unknown keys, and a `DigDataStoreMetadata` reader decoding a
+  `p`/`sz`-free store yields `program_hash == None` / `size_bucket == None`.
+
+  **`sz` decode is fail-closed (canonical minimal form).** A decoder accepts ONLY the canonical
+  minimal encoding of a value in `0..=10`: the empty atom (k=0) or a single byte `0x01`..`0x0a`. A
+  non-minimal encoding (a leading-zero atom like `[0x00]` or `[0x00,0x05]`), a byte `> 10`, or any
+  multi-byte atom is REJECTED (`FromClvmError::Custom`) — so the on-wire size has exactly one valid
+  representation and no producer can encode it two ways.
 - **`delegated_puzzles: Vec<DelegatedPuzzle>`** grants write authority beyond the owner:
   - `Admin(TreeHash)` — full control (may change the delegation set + root).
   - `Writer(TreeHash)` — may update the root but not the delegation set.
@@ -72,13 +88,14 @@ each landing in its own unit against the foundation.
 
 ```
 mint_datastore(parent_coin, owner, root_hash, label, description, bytes, size_proof,
-               program_hash, owner_puzzle_hash, delegated_puzzles, fee)
+               program_hash, size_bucket, owner_puzzle_hash, delegated_puzzles, fee)
     -> MerkleResult<MerkleCoinSpend>
 ```
 
-`program_hash: Option<Bytes32>` is additive: `None` mints an ordinary store byte-identical to a plain
-DataLayer store; `Some(h)` anchors the program tree-hash in the store metadata (CLVM key `p`). The
-returned `MerkleCoinSpend.child` is a `DataStore<DigDataStoreMetadata>`.
+`program_hash: Option<Bytes32>` and `size_bucket: Option<SizeBucket>` are additive: with both `None`
+the mint is byte-identical to a plain DataLayer store; `Some(h)` anchors the program tree-hash (CLVM
+key `p`) and `Some(bucket)` anchors the size bucket (CLVM key `sz`). The returned
+`MerkleCoinSpend.child` is a `DataStore<DigDataStoreMetadata>`.
 
 Launches a new DataLayer store singleton over `chia_wallet_sdk::driver::Launcher::mint_datastore`
 (INV-4). `parent_coin` funds AND parents the launcher: its `coin_id` becomes the launcher's parent,
@@ -90,8 +107,8 @@ DID coin as `parent_coin` with an `Owner::Custom` inner spend; the edge stays on
 The construction, byte-for-byte:
 
 1. `Launcher::new(parent_coin.coin_id(), 1).mint_datastore(ctx, DigDataStoreMetadata{root_hash,
-   label, description, bytes, size_proof, program_hash}, owner_puzzle_hash, delegated_puzzles)`
-   yields the launch conditions + the eve `DataStore`.
+   label, description, bytes, size_proof, program_hash, size_bucket}, owner_puzzle_hash,
+   delegated_puzzles)` yields the launch conditions + the eve `DataStore`.
 2. **Two-memo launcher-hint override (load-bearing).** The raw SDK mint emits only a single default
    launcher hint, which matches NO store already on chain. dig-merkle rewrites the launcher
    `CREATE_COIN` (the one to the singleton launcher puzzle hash
@@ -101,7 +118,8 @@ The construction, byte-for-byte:
    digstore-chain `singleton.rs`. This override is the DEFAULT behaviour, not opt-in.
 3. Change above `fee + 1` mojos returns to `owner_puzzle_hash`, hinted. The `fee` is paid
    **implicitly** as (coins in − coins out) — there is NO explicit `RESERVE_FEE`, matching the
-   on-chain producers.
+   on-chain producers. The `fee + 1` reservation is a CHECKED add: a `fee` so large that `fee + 1`
+   would overflow `u64::MAX` fails closed with `MerkleError::Chain` rather than wrapping around.
 4. `parent_coin` is spent with `owner`'s inner puzzle (`Owner::Standard` → `StandardLayer`;
    `Owner::Custom` → the caller's pre-built inner spend).
 
@@ -112,8 +130,9 @@ custom/DID inner owns its own requirement.
 
 **Root encoding.** The anchored `root_hash` is the first atom of the NFT-state-layer metadata CLVM
 `(root_hash . (("l" . label)? ("d" . description)? ("b" . bytes)? ("sp" . size_proof)? ("p" .
-program_hash)?))`, produced by `DigDataStoreMetadata::to_clvm` (which mirrors the SDK exactly and
-appends `("p" . program_hash)` LAST, only when `Some` — never hand-rolled).
+program_hash)? ("sz" . size_exponent)?))`, produced by `DigDataStoreMetadata::to_clvm` (which mirrors
+the SDK exactly, then appends `("p" . program_hash)` and finally `("sz" . size_exponent)` LAST, each
+only when `Some` — never hand-rolled).
 
 ### 3.2 update
 
@@ -254,10 +273,12 @@ backward-compatible:
 - **The legacy launcher path is retained.** The SDK's `from_memos` / `OldDlLauncherKvList` legacy
   key-value-list launcher parsing MUST remain supported; dig-merkle never drops it.
 - **Metadata is additive.** New optional metadata keys may be added; existing keys
-  (`root_hash`, `l`, `d`, `b`, `sp`) never change meaning or encoding. The `program_hash` key `p` is
-  such an addition: it is a NEW optional key appended after `sp`, omitted when absent. SDK-typed
-  readers ignore it (the SDK's `_ => ()` key tolerance), and a `p`-free coin decodes with
-  `program_hash == None` — old coins keep reading unchanged.
+  (`root_hash`, `l`, `d`, `b`, `sp`) never change meaning or encoding. The `program_hash` key `p` and
+  the `size_bucket` key `sz` are such additions: each is a NEW optional key appended after the SDK
+  keys (`p` after `sp`, then `sz` LAST), omitted when absent. SDK-typed readers ignore them (the
+  SDK's `_ => ()` key tolerance), and a `p`/`sz`-free coin decodes with `program_hash == None` /
+  `size_bucket == None` — old coins keep reading unchanged. The `sz` value is the size exponent in
+  canonical MINIMAL CLVM form (NC-8); a non-minimal or out-of-range encoding is rejected fail-closed.
 - **Prove it.** The test suite keeps golden coin-spend fixtures of each released layout; every
   format change MUST include a test decoding the older golden fixtures byte-identically. The mint
   golden test (`launcher_carries_the_two_memo_owner_discovery_hint`) pins the launcher `CREATE_COIN`
@@ -266,6 +287,10 @@ backward-compatible:
   minted coin matches stores already on chain. The program_hash additions are proved by
   `metadata_none_program_hash_is_byte_identical_to_sdk` (+ `mint_none_program_hash_is_byte_identical`
   at the coin level), `old_metadata_without_p_decodes_losslessly`, and `sdk_reader_ignores_program_hash`.
+  The size_bucket additions are proved by `metadata_none_sz_is_byte_identical_to_sdk`,
+  `sz_absent_leaves_p_encoding_unchanged`, `old_metadata_without_sz_decodes_losslessly`,
+  `sdk_reader_ignores_sz`, the NC-8 pin `sz_atom_is_minimally_encoded`, and the fail-closed
+  `sz_decode_rejects_non_minimal_and_oversized`.
 
 ## 9. Conformance
 
@@ -286,8 +311,12 @@ backward-compatible:
 - **Launcher memos.** A minted store's launcher `CREATE_COIN` carries exactly
   `[digstore_owner_hint(owner_ph), DATASTORE_LAUNCHER_HINT]`, in that order.
 - **Root metadata shape.** `root_hash` is the first atom of the metadata CLVM
-  `(root_hash . optional-kv-pairs)`; optional keys are `l`/`d`/`b`/`sp`/`p`, and `p` (program_hash)
-  is ALWAYS appended last, after `sp`, and only when present.
+  `(root_hash . optional-kv-pairs)`; optional keys are `l`/`d`/`b`/`sp`/`p`/`sz`. `p` (program_hash)
+  is appended after `sp`, then `sz` (size_bucket) is ALWAYS appended LAST — each only when present.
+- **Size-bucket ladder.** `sz` carries the size exponent `k ∈ 0..=10` mapping to `2^k MB` (1 MB =
+  1 MiB = 2^20 bytes; 1 MB..1 GB), encoded as a minimal CLVM integer (empty atom for k=0, one byte
+  `0x01`..`0x0a` otherwise). `SizeBucket::for_byte_len` is the canonical byte→bucket mapping. This
+  ladder is the canonical shared contract dig-store's SIZE PROOF consumes; it MUST NOT drift.
 - **Program-hash byte-identity.** A `DigDataStoreMetadata` with `program_hash == None` MUST serialize
   byte-identically to the SDK's `DataStoreMetadata` for the same shared fields. `DigDataStoreMetadata`
   and the SDK `DataStoreMetadata` MUST be mutually decodable for the shared keys (`root_hash`, `l`,

@@ -21,8 +21,9 @@ use hex_literal::hex;
 use crate::context::{drain_coin_spends, inner_spend};
 use crate::hint::{digstore_owner_hint, DATASTORE_LAUNCHER_HINT};
 use crate::metadata::DigDataStoreMetadata;
+use crate::size::SizeBucket;
 use crate::types::{Bytes32, Coin, DelegatedPuzzle, MerkleCoinSpend, Owner};
-use crate::MerkleResult;
+use crate::{MerkleError, MerkleResult};
 
 /// The well-known singleton launcher puzzle hash. A `CREATE_COIN` to this puzzle hash mints the
 /// store's launcher coin (whose `coin_id == launcher_id == store_id`); it is the memo carrier we
@@ -41,9 +42,11 @@ const SINGLETON_LAUNCHER_HASH: Bytes32 = Bytes32::new(hex!(
 /// matching the on-chain producers byte-for-byte.
 ///
 /// `program_hash` optionally anchors the CLVM tree-hash of a program/puzzle associated with the
-/// store/capsule; it is stored and echoed verbatim in the store metadata (CLVM key `"p"`, appended
-/// last) and is `None` for an ordinary store — a `None` mint is byte-identical to the SDK's default
-/// metadata (SPEC §2/§8). dig-merkle never computes `program_hash`; the producer passes it in.
+/// store/capsule; it is stored and echoed verbatim in the store metadata (CLVM key `"p"`) and is
+/// `None` for an ordinary store. `size_bucket` optionally anchors the store's size as a power-of-2
+/// bucket (CLVM key `"sz"`, appended last — see [`SizeBucket`]). With BOTH `None`, a mint is
+/// byte-identical to the SDK's default metadata (SPEC §2/§8). dig-merkle never computes either; the
+/// producer passes them in.
 ///
 /// `owner_puzzle_hash` is the store owner recorded in the singleton (and the target of the owner
 /// discovery hint + any change); `delegated_puzzles` grants admin/writer/oracle authority. The
@@ -77,6 +80,7 @@ pub fn mint_datastore(
     bytes: Option<u64>,
     size_proof: Option<String>,
     program_hash: Option<Bytes32>,
+    size_bucket: Option<SizeBucket>,
     owner_puzzle_hash: Bytes32,
     delegated_puzzles: Vec<DelegatedPuzzle>,
     fee: u64,
@@ -94,6 +98,7 @@ pub fn mint_datastore(
             bytes,
             size_proof,
             program_hash,
+            size_bucket,
         },
         owner_puzzle_hash.into(),
         delegated_puzzles,
@@ -106,7 +111,9 @@ pub fn mint_datastore(
 
     // Return the parent coin's surplus (above the 1-mojo launcher + `fee`) to the owner as change,
     // hinted to their puzzle hash. The fee is thereby paid implicitly (coins in minus coins out).
-    let reserved = fee + 1;
+    let reserved = fee
+        .checked_add(1)
+        .ok_or_else(|| MerkleError::Chain("fee overflow: fee + 1 exceeds u64::MAX".into()))?;
     let owner_conditions = if parent_coin.amount > reserved {
         let change_hint = ctx.hint(owner_puzzle_hash)?;
         launch_conditions.create_coin(
@@ -234,6 +241,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             owner_ph,
             vec![],
             1_000,
@@ -262,6 +270,7 @@ mod tests {
             bytes: Some(42),
             size_proof: None,
             program_hash: None,
+            size_bucket: None,
         };
         let node = metadata.to_clvm(&mut *ctx).expect("encode metadata");
         let (car, _rest) = <(Bytes32, NodePtr)>::from_clvm(&*ctx, node)
@@ -283,6 +292,7 @@ mod tests {
             Owner::Standard(owner.pk),
             root,
             Some("site".into()),
+            None,
             None,
             None,
             None,
@@ -330,6 +340,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             owner_ph,
             vec![],
             1_000,
@@ -357,6 +368,7 @@ mod tests {
             parent,
             Owner::Standard(owner_pk),
             Bytes32::new([0x02; 32]),
+            None,
             None,
             None,
             None,
@@ -457,6 +469,7 @@ mod tests {
             Some(10),
             None,
             None,
+            None,
             owner_ph,
             vec![],
             1_000,
@@ -500,6 +513,7 @@ mod tests {
             None,
             None,
             Some(program_hash),
+            None,
             owner_ph,
             vec![],
             0,
@@ -525,5 +539,80 @@ mod tests {
             "the program_hash survives the on-chain roundtrip"
         );
         Ok(())
+    }
+
+    /// A mint carrying a `size_bucket` validates on the simulator and hydrates back with BOTH the
+    /// anchored root and the size bucket preserved (SPEC §2/§5 roundtrip).
+    #[test]
+    fn mint_with_size_bucket_hydrates() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let owner = sim.bls(1_000_000);
+        let owner_ph: Bytes32 = StandardArgs::curry_tree_hash(owner.pk).into();
+        let root = Bytes32::new([0x5c; 32]);
+        let size_bucket = SizeBucket::from_exponent(6).expect("valid bucket");
+
+        let built = mint_datastore(
+            owner.coin,
+            Owner::Standard(owner.pk),
+            root,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(size_bucket),
+            owner_ph,
+            vec![],
+            0,
+        )?;
+        let datastore = built.child.clone().expect("mint yields a child datastore");
+
+        sim.spend_coins(built.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
+
+        let mut ctx = SpendContext::new();
+        let launcher_spend = built
+            .coin_spends
+            .iter()
+            .find(|s| s.coin.coin_id() == datastore.info.launcher_id)
+            .expect("launcher-coin spend present");
+        let hydrated =
+            DataStore::<DigDataStoreMetadata>::from_spend(&mut ctx, launcher_spend, &[])?
+                .expect("launcher spend hydrates a datastore");
+
+        assert_eq!(hydrated.info.metadata.root_hash, root);
+        assert_eq!(
+            hydrated.info.metadata.size_bucket,
+            Some(size_bucket),
+            "the size bucket survives the on-chain roundtrip"
+        );
+        Ok(())
+    }
+
+    /// Regression (#1227): a `fee == u64::MAX` must fail closed with [`MerkleError::Chain`] rather
+    /// than wrap around (which the old `fee + 1` would, silently returning surplus as change).
+    #[test]
+    fn mint_fee_overflow_fails_closed() {
+        let (owner_pk, owner_ph) = seeded_owner();
+        let parent = Coin::new(Bytes32::new([0xfe; 32]), owner_ph, 1_000_000);
+
+        let result = mint_datastore(
+            parent,
+            Owner::Standard(owner_pk),
+            Bytes32::new([0x03; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            vec![],
+            u64::MAX,
+        );
+
+        assert!(
+            matches!(result, Err(MerkleError::Chain(_))),
+            "fee == u64::MAX must error, not panic or wrap"
+        );
     }
 }
