@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.4.3] - 2026-07-20
+
+### Bug Fixes
+- **lineage:** Child_lineage_proof derives parent_inner_puzzle_hash via the DL updater path (#1332) (#7)
+
 ## [0.4.2] - 2026-07-20
 
 ### Testing
