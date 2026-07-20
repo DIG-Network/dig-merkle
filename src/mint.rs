@@ -19,7 +19,7 @@ use chia_wallet_sdk::types::{Condition, Conditions};
 use hex_literal::hex;
 
 use crate::context::{drain_coin_spends, inner_spend};
-use crate::hint::{digstore_owner_hint, DATASTORE_LAUNCHER_HINT};
+use crate::hint::{digstore_owner_hint, launcher_hint_for, StoreKind};
 use crate::metadata::DigDataStoreMetadata;
 use crate::size::SizeBucket;
 use crate::types::{Bytes32, Coin, DelegatedPuzzle, MerkleCoinSpend, Owner};
@@ -68,10 +68,51 @@ const SINGLETON_LAUNCHER_HASH: Bytes32 = Bytes32::new(hex!(
 ///
 /// # Errors
 ///
-/// Returns [`MerkleError::Driver`](crate::MerkleError::Driver) if the SDK fails to construct the
+/// Returns [`MerkleError::Driver`] if the SDK fails to construct the
 /// launcher or the owner spend (e.g. an invalid metadata or delegated-puzzle set).
 #[allow(clippy::too_many_arguments)]
 pub fn mint_datastore(
+    parent_coin: Coin,
+    owner: Owner,
+    root_hash: Bytes32,
+    label: Option<String>,
+    description: Option<String>,
+    size_proof: Option<String>,
+    program_hash: Option<Bytes32>,
+    size_bucket: Option<SizeBucket>,
+    owner_puzzle_hash: Bytes32,
+    delegated_puzzles: Vec<DelegatedPuzzle>,
+    fee: u64,
+) -> MerkleResult<MerkleCoinSpend> {
+    // The historical entry point mints an ordinary file-backed store — byte-identical to every store
+    // chip35_dl_coin and digstore-chain already publish (its launcher discriminator is unchanged).
+    mint_datastore_with_kind(
+        StoreKind::File,
+        parent_coin,
+        owner,
+        root_hash,
+        label,
+        description,
+        size_proof,
+        program_hash,
+        size_bucket,
+        owner_puzzle_hash,
+        delegated_puzzles,
+        fee,
+    )
+}
+
+/// Builds the unsigned spends that mint a new DataLayer store of a chosen [`StoreKind`] (#1263).
+///
+/// Identical to [`mint_datastore`] in every respect except the SECOND launcher memo — the kind
+/// discriminator ([`launcher_hint_for`]). [`StoreKind::File`] emits exactly the same bytes as
+/// [`mint_datastore`] (they share this implementation), so a file mint stays byte-identical to
+/// existing on-chain stores; [`StoreKind::DidProfile`] emits the DID-profile discriminator instead.
+/// The first launcher memo is always the kind-agnostic owner hint. See [`mint_datastore`] for the
+/// full argument, DID-composition, signing, and error semantics.
+#[allow(clippy::too_many_arguments)]
+pub fn mint_datastore_with_kind(
+    kind: StoreKind,
     parent_coin: Coin,
     owner: Owner,
     root_hash: Bytes32,
@@ -105,7 +146,8 @@ pub fn mint_datastore(
     // Override the launcher CREATE_COIN memos to the two-memo owner-discovery hint (SPEC §9). This is
     // the byte-identity requirement: the raw SDK mint emits only a single default hint, which matches
     // no store already on chain.
-    let launch_conditions = override_launcher_hint(&mut ctx, launch_conditions, owner_puzzle_hash)?;
+    let launch_conditions =
+        override_launcher_hint(&mut ctx, launch_conditions, owner_puzzle_hash, kind)?;
 
     // Return the parent coin's surplus (above the 1-mojo launcher + `fee`) to the owner as change,
     // hinted to their puzzle hash. The fee is thereby paid implicitly (coins in minus coins out).
@@ -136,13 +178,15 @@ pub fn mint_datastore(
 /// Rewrites the launcher `CREATE_COIN` in `conditions` to carry the two owner-discovery memos.
 ///
 /// The SDK's `mint_datastore` emits the launcher `CREATE_COIN` with a single default hint; every DIG
-/// producer replaces it with `[digstore_owner_hint(owner_ph), DATASTORE_LAUNCHER_HINT]` so the store
-/// is owner-discoverable and byte-identical on chain (SPEC §9). Every other condition passes through
-/// unchanged.
+/// producer replaces it with `[digstore_owner_hint(owner_ph), launcher_hint_for(kind)]` so the store
+/// is owner-discoverable and byte-identical on chain (SPEC §9). The second memo is the kind
+/// discriminator — [`StoreKind::File`] keeps the historical `DATASTORE_LAUNCHER_HINT` bytes. Every
+/// other condition passes through unchanged.
 fn override_launcher_hint(
     ctx: &mut SpendContext,
     conditions: Conditions,
     owner_puzzle_hash: Bytes32,
+    kind: StoreKind,
 ) -> MerkleResult<Conditions> {
     let mut rewritten = Conditions::new();
     for condition in conditions {
@@ -152,7 +196,7 @@ fn override_launcher_hint(
             {
                 let memos = ctx.memos(&[
                     digstore_owner_hint(owner_puzzle_hash),
-                    DATASTORE_LAUNCHER_HINT,
+                    launcher_hint_for(kind),
                 ])?;
                 rewritten = rewritten.with(Condition::CreateCoin(CreateCoin {
                     puzzle_hash: create_coin.puzzle_hash,
@@ -248,8 +292,45 @@ mod tests {
         let memos = launcher_memos(&spend.coin_spends);
         assert_eq!(
             memos,
-            vec![digstore_owner_hint(owner_ph), DATASTORE_LAUNCHER_HINT],
+            vec![
+                digstore_owner_hint(owner_ph),
+                launcher_hint_for(StoreKind::File)
+            ],
             "launcher memos must be [owner_hint, launcher_hint] byte-for-byte"
+        );
+    }
+
+    /// #1263: a `DidProfile` mint emits the DID-profile discriminator as `memo[1]` while keeping the
+    /// kind-agnostic owner hint as `memo[0]` — the additive kind split on the write side.
+    #[test]
+    fn did_profile_mint_carries_the_profile_discriminator() {
+        use crate::hint::DID_PROFILE_LAUNCHER_HINT;
+        use crate::mint::mint_datastore_with_kind;
+
+        let (owner_pk, owner_ph) = seeded_owner();
+        let parent = Coin::new(Bytes32::new([0x55; 32]), owner_ph, 1_000_000);
+
+        let spend = mint_datastore_with_kind(
+            StoreKind::DidProfile,
+            parent,
+            Owner::Standard(owner_pk),
+            Bytes32::new([0xab; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            vec![],
+            1_000,
+        )
+        .expect("did-profile mint builds");
+
+        let memos = launcher_memos(&spend.coin_spends);
+        assert_eq!(
+            memos,
+            vec![digstore_owner_hint(owner_ph), DID_PROFILE_LAUNCHER_HINT],
+            "a DidProfile mint carries the profile discriminator as memo[1]"
         );
     }
 
@@ -421,9 +502,13 @@ mod tests {
                 vec![],
             )
             .expect("reference mint builds");
-        let launch_conditions =
-            override_launcher_hint(&mut ctx, launch_conditions, owner_puzzle_hash)
-                .expect("reference hint override");
+        let launch_conditions = override_launcher_hint(
+            &mut ctx,
+            launch_conditions,
+            owner_puzzle_hash,
+            StoreKind::File,
+        )
+        .expect("reference hint override");
 
         let reserved = fee + 1;
         let owner_conditions = if parent_coin.amount > reserved {

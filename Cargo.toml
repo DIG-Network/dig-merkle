@@ -15,7 +15,7 @@
 # foundation — their modules are declared as doc-only stubs so the layout is final.
 [package]
 name = "dig-merkle"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -50,6 +50,10 @@ chia-sha2 = "0.26"
 hex-literal = "0.4"
 # The crate error taxonomy (SPEC §6). thiserror 2 matches the sibling DIG crates.
 thiserror = "2"
+# The CANONICAL chain-read interface consumed by `resolve_owner_did` (SPEC §3.7) — a reference-DOWN
+# pure leaf below dig-merkle. Injected by the caller so dig-merkle opens no socket (INV-1). crates.io
+# only (no git deps), chia-protocol 0.26 to match the rest of the tree.
+dig-chainsource-interface = "0.1"
 
 [dev-dependencies]
 # The in-process Chia Simulator + BLS keypair helpers for building real coin spends in tests.
@@ -58,3 +62,5 @@ chia-sdk-test = "0.30"
 hex = "0.4"
 # Ergonomic `?`-propagating Result for the simulator integration tests.
 anyhow = "1"
+# The in-memory `MockChainSource` for driving `resolve_owner_did`'s fail-closed lineage walk.
+dig-chainsource-interface = { version = "0.1", features = ["testing"] }
