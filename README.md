@@ -18,9 +18,12 @@ dig-merkle = "0.2"
 
 A **DataLayer coin** is a CHIP-0035 singleton whose `launcher_id` IS the DIG `store_id`. Its
 metadata (`DigDataStoreMetadata`) carries the anchored `.dig` capsule merkle `root_hash` plus
-optional label/description/bytes/size-proof and an additive `program_hash` (the CLVM tree-hash of an
-associated program/puzzle — stored and echoed, never computed here; `None` mints a store
-byte-identical to a plain DataLayer store). Its delegated-puzzle list grants admin/writer/oracle
+optional label/description/size-proof, the additive `program_hash` (the CLVM tree-hash of an
+associated program/puzzle — stored and echoed, never computed here), and the store size as a
+`size_bucket` (a `SizeBucket` — a power-of-2 bucket, `k ∈ 0..=10` ↔ `2^k MB`, 1 MB..1 GB, CLVM key
+`sz`) that REPLACES the SDK's exact-byte `"b"` field (dig-merkle never emits `"b"`). With
+`size_bucket` and `program_hash` both `None` a mint is byte-identical to a plain DataLayer store. Its
+delegated-puzzle list grants admin/writer/oracle
 authority. Spending the coin recreates it with a new root, a new delegation set, or a new owner — or
 melts it. Publishing a new capsule root IS a DataLayer update. dig-merkle builds each such spend,
 **unsigned**.
@@ -71,7 +74,8 @@ designed surface; each lands in its own unit.
 
 | Function | Semantics | Signing |
 |---|---|---|
-| `mint::mint_datastore(parent_coin, owner, root_hash, label, description, bytes, size_proof, program_hash, owner_ph, delegated, fee)` | **shipped** — launch a new DataLayer store anchoring a root, byte-identical to on-chain stores | owner's `AGG_SIG_ME` |
+| `mint::mint_datastore(parent_coin, owner, root_hash, label, description, size_proof, program_hash, size_bucket, owner_ph, delegated, fee)` | **shipped** — launch a new DataLayer store anchoring a root, byte-identical to on-chain stores | owner's `AGG_SIG_ME` |
+| `size::SizeBucket` (`from_exponent`/`for_byte_len`/`exponent`/`megabytes`/`byte_len`) | **shipped** — the canonical `.dig` size-bucket ladder (`k ∈ 0..=10` ↔ `2^k MB`, 1 MB..1 GB); CLVM key `sz`, replaces the exact-byte `"b"` | — |
 | `digstore_owner_hint(owner_ph)` / `DATASTORE_LAUNCHER_HINT` / `DIGSTORE_OWNER_HINT_DOMAIN` | **shipped** — the owner-discovery hint (SPEC §9) | — |
 | `read::did_ref_from_spend(&coin_spend)` | **shipped** — recognise a DID coin spend, returning its `DidRef { launcher_id }` (fail-closed to `None`) | none |
 | `read::resolve_owner_did(store_id, &chain)` | recover the DID that owns a store via a `ChainSource` lineage walk (SPEC §3.7) — *pending `dig-chainsource-interface` crates.io publish* | none |
@@ -138,7 +142,8 @@ no `git` dependencies); `did_ref_from_spend` + `DidRef` are available now.
 - `types` — `MerkleCoinSpend`, `Owner`, and the re-exported SDK types (`DataStore`,
   `DataStoreMetadata`, `DataStoreInfo`, `DelegatedPuzzle`, `Bytes32`, `Coin`, `CoinSpend`,
   `LineageProof`, `Proof`).
-- `metadata` — `DigDataStoreMetadata`, the additive `program_hash` metadata superset (shipped, SPEC §2).
+- `metadata` — `DigDataStoreMetadata`, the SDK metadata with `"b"` replaced by `size_bucket` (`"sz"`) + the additive `program_hash` (shipped, SPEC §2).
+- `size` — `SizeBucket`, the canonical `.dig` size-bucket ladder (shipped, SPEC §2).
 - `error` — `MerkleError` / `MerkleResult` (the error taxonomy, SPEC §6).
 - `sign` — `required_signatures` (the signing boundary, SPEC §4).
 - `mint` — `mint_datastore` (shipped, SPEC §3.1).

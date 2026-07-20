@@ -61,6 +61,11 @@ pub enum MerkleError {
     /// An operation was asked to spend an empty coin set (SPEC §6).
     #[error("no coins supplied to spend")]
     EmptyCoins,
+
+    /// A size-bucket exponent or byte length fell outside the `0..=10` (1 MB..1 GB) ladder
+    /// (SPEC §2). The string states the specific out-of-range value.
+    #[error("invalid size bucket: {0}")]
+    InvalidSize(String),
 }
 
 #[cfg(test)]
@@ -100,6 +105,10 @@ mod tests {
         assert_eq!(
             MerkleError::EmptyCoins.to_string(),
             "no coins supplied to spend"
+        );
+        assert_eq!(
+            MerkleError::InvalidSize("exponent 11 exceeds 10".into()).to_string(),
+            "invalid size bucket: exponent 11 exceeds 10"
         );
     }
 

@@ -11,7 +11,9 @@
 //!
 //! A DataLayer coin is a CHIP-0035 singleton whose `launcher_id` IS the DIG `store_id`. Its
 //! [`DataStoreMetadata`] carries the capsule's `root_hash` (the anchored `.dig` merkle root) plus
-//! optional `label`/`description`/`bytes`/`size_proof`, and its [`DelegatedPuzzle`] list grants
+//! optional `label`/`description`/`size_proof`, the additive `program_hash` (`"p"`), and the store
+//! size as a power-of-2 `size_bucket` (`"sz"` — see [`SizeBucket`]) that REPLACES the SDK's exact
+//! `bytes`/`"b"` field, and its [`DelegatedPuzzle`] list grants
 //! admin/writer/oracle authority. Spending the coin recreates it with a new root, transferring
 //! ownership, delegating write access, or melting it. dig-merkle builds each such spend unsigned.
 //!
@@ -75,6 +77,8 @@ pub mod metadata;
 
 pub mod mint;
 
+pub mod size;
+
 /// Recreate the DataLayer coin with a new merkle root — an owner or writer update (future unit,
 /// SPEC §3.2).
 pub mod update {}
@@ -110,6 +114,7 @@ pub use metadata::DigDataStoreMetadata;
 pub use mint::mint_datastore;
 pub use read::{did_ref_from_spend, DidRef};
 pub use sign::required_signatures;
+pub use size::SizeBucket;
 pub use types::{
     Bytes32, Coin, CoinSpend, DataStore, DataStoreInfo, DataStoreMetadata, DelegatedPuzzle,
     LineageProof, MerkleCoinSpend, Owner, Proof,
