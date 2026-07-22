@@ -248,6 +248,18 @@ to a READ: `resolve_owner_did` walks the launcher lineage via the injected `Chai
 with `did_ref_from_spend`. Any missing spend, or a non-DID creator, yields `Ok(None)` — never a
 fabricated result and never an error for "not DID-owned".
 
+**Store-id binding is MANDATORY per hop (NC-9).** The injected `ChainSource` is trusted only to
+return CONFIRMED spends, never to return the RIGHT coin — a hostile or buggy source (the public
+`rpc.dig.net` gateway is attacker-influenceable, §5.3) can answer a read with a DIFFERENT store's
+valid, DID-rooted launcher. `resolve_owner_did` therefore binds every hop to the requested identity
+and fails CLOSED on any mismatch — it MUST NOT return a `Some(DidRef)` it cannot bind to `store_id`:
+- The launcher spend returned for `store_id` MUST satisfy `launcher_spend.coin.coin_id() == store_id`
+  (a DIG store id IS its launcher coin id). A mismatch is rejected with `Err(MerkleError::Chain)`.
+- The creator spend returned for `parent_id` MUST satisfy `creator_spend.coin.coin_id() == parent_id`
+  (the creator is the launcher's parent). A mismatch is rejected with `Err(MerkleError::Chain)`.
+A substituted answer is deliberately surfaced as `Err(Chain)`, not `Ok(None)`, so a hostile-source
+substitution is distinguishable from a genuinely non-DID-owned store.
+
 ## 6. Error taxonomy
 
 `MerkleError` (all fallible operations return `MerkleResult<T>`):
