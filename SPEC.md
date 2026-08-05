@@ -23,7 +23,7 @@ Four invariants hold across the entire crate:
 - **INV-3 — Unsigned output.** Every operation returns an unsigned `MerkleCoinSpend` — the coin
   spends plus the recreated child `DataStore`. Signatures are always the caller's responsibility.
 - **INV-4 — SDK byte-source-of-truth.** Every puzzle, layer, and coin-spend byte is produced by
-  `chia-wallet-sdk` (pinned to the 0.30 / chia-protocol 0.26 family, `chip-0035` feature).
+  `chia-wallet-sdk` (pinned to the 0.34 / chia-protocol 0.36.1 family, `chip-0035` feature).
   dig-merkle adds workflow ergonomics on top; it never re-implements a puzzle or hand-rolls a spend
   bundle, and re-exports the SDK's DataStore types verbatim (no shadow copy).
 

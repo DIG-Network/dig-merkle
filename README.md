@@ -41,8 +41,8 @@ re-implemented puzzle.
   signed; the caller's signer produces the signatures.
 - **INV-3 — Unsigned output.** Every operation returns an unsigned `MerkleCoinSpend` (coin spends +
   the recreated child `DataStore`).
-- **INV-4 — SDK byte-source-of-truth.** Every byte comes from `chia-wallet-sdk` (0.30 /
-  chia-protocol 0.26, `chip-0035` feature); the SDK's DataStore types are re-exported verbatim.
+- **INV-4 — SDK byte-source-of-truth.** Every byte comes from `chia-wallet-sdk` (0.34 /
+  chia-protocol 0.36.1, `chip-0035` feature); the SDK's DataStore types are re-exported verbatim.
 
 ## Consumer pattern
 
