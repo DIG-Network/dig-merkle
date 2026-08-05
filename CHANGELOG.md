@@ -6,12 +6,8 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ## [0.5.0] - 2026-08-05
 
-### Changed
-- **deps:** Migrate the chia family to the 0.34 / chia-protocol 0.36.1 line
-  (chia-wallet-sdk 0.34, chia-protocol/chia-puzzle-types/clvm-traits/chia-sha2 0.36.1,
-  chia-sdk-test 0.34, dig-chainsource-interface 0.3). Behavior-preserving: the built
-  DataLayer CHIP-0035 spends stay byte-identical — all 63 tests incl. the simulator
-  spend-validation suite pass unchanged. Leaf 5 of the chia-family cascade (dig_ecosystem#2140).
+### Features
+- **deps:** Migrate to the chia-wallet-sdk 0.34 / chia-0.36 family
 
 ## [0.4.5] - 2026-07-22
 
