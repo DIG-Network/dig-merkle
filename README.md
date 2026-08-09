@@ -99,17 +99,26 @@ on-chain. It is the default behaviour, verified by a golden test.
 
 ### DID composition
 
-`mint_datastore` takes a **`parent_coin`**, not a full launcher, so a DID-authorized launcher
-produced by [`dig-did`](https://crates.io/crates/dig-did) composes here **without a `dig-did`
-dependency**: pass the DID coin as `parent_coin` with an `Owner::Custom` inner spend that satisfies
-the DID puzzle. The dependency edge is one-way (dig-identity → dig-merkle); dig-merkle depends on no
+A DIG store can be rooted in a DID **without a `dig-did` dependency**. The composable path is:
+
+1. Call `mint_datastore_launch_with_kind(&mut ctx, parent_coin, ..)` — this stages the launcher and
+   eve-DataStore spends into `ctx` and returns a `DatastoreLaunch` whose `parent_conditions` carry
+   the launcher `CREATE_COIN` (and its coin-announcement assertion) that the DID-authorized parent
+   spend **must** emit.
+2. Build your DID-authorized parent-coin spend on the **same** `ctx`, folding in
+   `DatastoreLaunch::parent_conditions`.
+3. Drain `ctx` once to get the complete spend bundle.
+
+`mint_datastore_with_kind` (the all-in-one wrapper) accepts only `Owner::Standard` and rejects
+`Owner::Custom` with `MerkleError::UnsupportedOwner` — use the composable API above for DID-rooted
+stores. The dependency edge stays one-way (dig-identity → dig-merkle); dig-merkle depends on no
 `dig-*` crate except the canonical leaf `dig-chainsource-interface` (a reference-DOWN pure read
 interface BELOW dig-merkle, for §3.7 — pending its crates.io publish).
 
 ### Owner-DID discovery
 
-A store can be rooted in a DID (mint it with the DID coin as `parent_coin` + an `Owner::Custom`
-inner spend, above). To recover the owning DID back from chain, `resolve_owner_did` walks the store's
+A store rooted in a DID (minted via the composable path above) can be identified on-chain.
+To recover the owning DID back from chain, `resolve_owner_did` walks the store's
 launcher lineage one hop up and recognises a DID creator — delegating ALL chain reads to a
 caller-supplied `ChainSource` (the canonical `dig_chainsource_interface::ChainSource`), so dig-merkle
 stays network-free (INV-1):

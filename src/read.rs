@@ -1,7 +1,9 @@
 //! Reading on-chain DataLayer state without spending (SPEC §3.6/§3.7) — owner-DID discovery.
 //!
 //! A DIG store can be rooted in a DID: the store's launcher coin is created by spending a
-//! DID-authorized coin (an [`crate::Owner::Custom`] mint whose parent is the DID coin). This module
+//! DID-authorized parent coin whose spend emits the launcher `CREATE_COIN` obtained from
+//! [`crate::DatastoreLaunch::parent_conditions`] (returned by
+//! [`crate::mint_datastore_launch_with_kind`]). This module
 //! recovers that owning DID by walking the store's launcher lineage one hop up to its creator and
 //! recognising a DID coin spend.
 //!
