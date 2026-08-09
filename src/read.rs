@@ -77,6 +77,18 @@ pub fn did_ref_from_spend(spend: &CoinSpend) -> MerkleResult<Option<DidRef>> {
 
     let puzzle = Puzzle::parse(&allocator, puzzle_ptr);
 
+    // The reveal must be the puzzle the coin COMMITS to. `Did::parse` never compares the two, and a
+    // coin id is computed from the coin's own fields, so a binding on the coin id alone lets a hostile
+    // chain source pair a genuine coin with a forged reveal and have a DID attributed to a store that
+    // has none. This is the same check `is_launcher_intermediate` makes on the intermediate hop.
+    if Bytes32::from(puzzle.curried_puzzle_hash()) != spend.coin.puzzle_hash {
+        return Err(MerkleError::Chain(format!(
+            "the puzzle reveal for coin {} does not hash to the coin's puzzle hash — the source \
+             returned a puzzle the coin never committed to",
+            spend.coin.coin_id()
+        )));
+    }
+
     match Did::parse(&allocator, spend.coin, puzzle, solution_ptr)? {
         Some((did, _p2_spend)) => Ok(Some(DidRef {
             launcher_id: did.info.launcher_id,
@@ -860,6 +872,76 @@ mod tests {
             "KNOWN GAP #2463: the memo-scannable profile chain resolves to None, because the \
              launcher's creator is an ordinary coin the walk cannot traverse without running \
              chain-supplied CLVM"
+        );
+        Ok(())
+    }
+
+    /// A hostile [`ChainSource`] cannot attribute a DID to a store that has none by pairing a GENUINE
+    /// coin with a FORGED puzzle reveal.
+    ///
+    /// The coin-id binding cannot catch this: a coin id is computed from the coin's own fields, so it
+    /// is satisfied by any reveal whatsoever, and `Did::parse` never compares the reveal to
+    /// `coin.puzzle_hash`. Here the creator coin is an ordinary standard-p2 coin with no DID link at
+    /// all, served with a real DID's puzzle reveal — and the walk must refuse rather than name a DID.
+    ///
+    /// The control is the same walk over the same store with the coin's OWN reveal, which correctly
+    /// resolves to `None`: so this observes the reveal binding, not a fixture that could not resolve
+    /// anything.
+    #[test]
+    fn a_forged_puzzle_reveal_cannot_attribute_a_did() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let (did_spend, _did_launcher_id) = did_coin_and_spend(&mut sim)?;
+
+        // An ordinary standard-p2 coin, spent honestly — it is nobody's DID.
+        let ctx = &mut SpendContext::new();
+        let alice = sim.bls(1);
+        let alice_p2 = StandardLayer::new(alice.pk);
+        alice_p2.spend(ctx, alice.coin, Conditions::new())?;
+        let honest_creator = ctx
+            .take()
+            .into_iter()
+            .find(|spend| spend.coin.coin_id() == alice.coin.coin_id())
+            .expect("the ordinary coin's spend is present");
+
+        let launcher_coin = Coin::new(alice.coin.coin_id(), Bytes32::new([0xb2; 32]), 1);
+        let store_id = launcher_coin.coin_id();
+        let launcher_spend = CoinSpend::new(
+            launcher_coin,
+            honest_creator.puzzle_reveal.clone(),
+            honest_creator.solution.clone(),
+        );
+
+        // Control: served honestly, the store is simply not DID-owned.
+        let honest = MockChainSource::new()
+            .with_spend(store_id, launcher_spend.clone())
+            .with_spend(alice.coin.coin_id(), honest_creator.clone());
+        assert_eq!(
+            resolve_owner_did(store_id, &honest)?,
+            None,
+            "the ordinary creator is not a DID (control)"
+        );
+
+        // The attack: the same genuine coin, served with a real DID's puzzle reveal.
+        let forged = CoinSpend::new(
+            honest_creator.coin,
+            did_spend.puzzle_reveal.clone(),
+            did_spend.solution.clone(),
+        );
+        assert_eq!(
+            forged.coin.coin_id(),
+            alice.coin.coin_id(),
+            "the coin-id binding is satisfied — only the reveal is forged"
+        );
+        let hostile = MockChainSource::new()
+            .with_spend(store_id, launcher_spend)
+            .with_spend(alice.coin.coin_id(), forged);
+
+        assert!(
+            matches!(
+                resolve_owner_did(store_id, &hostile),
+                Err(MerkleError::Chain(_))
+            ),
+            "a reveal the coin never committed to must be refused, never resolved to a DID"
         );
         Ok(())
     }

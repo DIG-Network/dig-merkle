@@ -348,8 +348,13 @@ pub fn mint_datastore_launch_with_kind(
     // Override the launcher CREATE_COIN memos to the two-memo owner-discovery hint (SPEC §9). This is
     // the byte-identity requirement: the raw SDK mint emits only a single default hint, which matches
     // no store already on chain.
-    let (parent_conditions, launcher_memos_written) =
-        override_launcher_hint(ctx, launch_conditions, owner_puzzle_hash, kind)?;
+    let (parent_conditions, launcher_memos_written) = override_launcher_hint(
+        ctx,
+        launch_conditions,
+        launcher_coin,
+        owner_puzzle_hash,
+        kind,
+    )?;
 
     #[cfg(test)]
     let parent_conditions = tests::drop_launcher_if_armed(parent_conditions);
@@ -511,7 +516,8 @@ fn spend_creates(
     }))
 }
 
-/// Rewrites the launcher `CREATE_COIN` in `conditions` to carry the two owner-discovery memos.
+/// Rewrites THIS launch's launcher `CREATE_COIN` in `conditions` to carry the two owner-discovery
+/// memos.
 ///
 /// The SDK's `mint_datastore` emits the launcher `CREATE_COIN` with a single default hint; every DIG
 /// producer replaces it with `[digstore_owner_hint(owner_ph), launcher_hint_for(kind)]` so the store
@@ -519,7 +525,14 @@ fn spend_creates(
 /// discriminator — [`StoreKind::File`] keeps the historical `DATASTORE_LAUNCHER_HINT` bytes. Every
 /// other condition passes through unchanged.
 ///
-/// Returns the rewritten conditions and whether a launcher `CREATE_COIN` was actually found to
+/// **The match is on `launcher_coin`'s full coin id, not merely the launcher puzzle hash.** A caller
+/// may supply base conditions (`Launcher::from_coin`) that already contain ANOTHER store's launcher
+/// `CREATE_COIN`; stamping that one too would silently index a second store under THIS owner and
+/// [`StoreKind`], mis-attributing it in every owner-discovery scan. The coin id a `CREATE_COIN` would
+/// produce is fully determined here — the launcher's parent is known — so the right condition is
+/// identified exactly rather than by shape.
+///
+/// Returns the rewritten conditions and whether that launcher `CREATE_COIN` was actually found to
 /// rewrite. It is absent whenever the launcher is created by an intermediate coin rather than by the
 /// parent, and in that case `kind` and the owner hint reach no condition at all — the caller reports
 /// that fact as [`DatastoreLaunch::launcher_memos_written`] rather than claiming a hint it never
@@ -527,16 +540,25 @@ fn spend_creates(
 fn override_launcher_hint(
     ctx: &mut SpendContext,
     conditions: Conditions,
+    launcher_coin: Coin,
     owner_puzzle_hash: Bytes32,
     kind: StoreKind,
 ) -> MerkleResult<(Conditions, bool)> {
+    let is_this_launcher = |create_coin: &CreateCoin<_>| {
+        Coin::new(
+            launcher_coin.parent_coin_info,
+            create_coin.puzzle_hash,
+            create_coin.amount,
+        )
+        .coin_id()
+            == launcher_coin.coin_id()
+    };
+
     let mut memos_written = false;
     let mut rewritten = Conditions::new();
     for condition in conditions {
         match condition {
-            Condition::CreateCoin(create_coin)
-                if create_coin.puzzle_hash == SINGLETON_LAUNCHER_PUZZLE_HASH =>
-            {
+            Condition::CreateCoin(create_coin) if is_this_launcher(&create_coin) => {
                 let memos = ctx.memos(&[
                     digstore_owner_hint(owner_puzzle_hash),
                     launcher_hint_for(kind),
@@ -832,7 +854,9 @@ mod tests {
         use chia_wallet_sdk::driver::DataStoreMetadata;
 
         let mut ctx = SpendContext::new();
-        let (launch_conditions, _datastore) = Launcher::new(parent_coin.coin_id(), 1)
+        let reference_launcher = Launcher::new(parent_coin.coin_id(), 1);
+        let reference_launcher_coin = reference_launcher.coin();
+        let (launch_conditions, _datastore) = reference_launcher
             .mint_datastore(
                 &mut ctx,
                 DataStoreMetadata {
@@ -849,6 +873,7 @@ mod tests {
         let (launch_conditions, memos_written) = override_launcher_hint(
             &mut ctx,
             launch_conditions,
+            reference_launcher_coin,
             owner_puzzle_hash,
             StoreKind::File,
         )
@@ -1393,6 +1418,90 @@ mod tests {
             "a 0-amount launcher minting a 1-mojo singleton is the SDK's documented composition and \
              must be accepted, got: {result:?}"
         );
+    }
+
+    /// LOAD-BEARING: the memo rewrite stamps THIS launch's launcher only.
+    ///
+    /// `Launcher::from_coin` lets a caller supply base conditions, so those conditions can already
+    /// contain ANOTHER store's launcher `CREATE_COIN` — same puzzle hash, different coin. A rewrite
+    /// matching on the puzzle hash stamps both, indexing a store this caller does not own under this
+    /// owner hint and [`StoreKind`], which is a silent mis-attribution in every owner-discovery scan.
+    ///
+    /// Both halves are asserted from one bundle, so the test cannot pass by rewriting nothing: OUR
+    /// launcher carries the two-memo hint, and the foreign one carries exactly the memos it arrived
+    /// with.
+    #[test]
+    fn the_memo_rewrite_leaves_a_foreign_launcher_alone() -> anyhow::Result<()> {
+        let (_owner_pk, owner_ph) = seeded_owner();
+        let ctx = &mut SpendContext::new();
+        let parent_id = Bytes32::new([0x71; 32]);
+
+        // A second store's launcher: same parent and puzzle hash, a DIFFERENT amount — so a different
+        // coin, carrying a foreign owner's hint.
+        let foreign_owner_ph = Bytes32::new([0x0f; 32]);
+        let foreign_memos = ctx.memos(&[digstore_owner_hint(foreign_owner_ph)])?;
+        let ours = Launcher::new(parent_id, 1);
+        let ours_coin = ours.coin();
+        let foreign_coin = Coin::new(parent_id, ours_coin.puzzle_hash, 3);
+        assert_ne!(
+            foreign_coin.coin_id(),
+            ours_coin.coin_id(),
+            "the two launchers are different coins at the same puzzle hash"
+        );
+
+        let launch = mint_datastore_launch_with_kind(
+            ctx,
+            StoreKind::DidProfile,
+            Launcher::from_coin(
+                ours_coin,
+                Conditions::new()
+                    .create_coin(ours_coin.puzzle_hash, ours_coin.amount, Memos::None)
+                    .create_coin(foreign_coin.puzzle_hash, foreign_coin.amount, foreign_memos),
+            ),
+            Bytes32::new([0x6d; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            vec![],
+        )?;
+
+        let memos_of = |amount: u64| -> Option<Vec<Bytes32>> {
+            launch
+                .parent_conditions
+                .iter()
+                .find_map(|condition| match condition {
+                    Condition::CreateCoin(cc)
+                        if cc.puzzle_hash == SINGLETON_LAUNCHER_PUZZLE_HASH
+                            && cc.amount == amount =>
+                    {
+                        match cc.memos {
+                            Memos::Some(ptr) => {
+                                Some(Vec::<Bytes32>::from_clvm(&**ctx, ptr).expect("parse memos"))
+                            }
+                            Memos::None => None,
+                        }
+                    }
+                    _ => None,
+                })
+        };
+
+        assert_eq!(
+            memos_of(ours_coin.amount),
+            Some(vec![
+                digstore_owner_hint(owner_ph),
+                launcher_hint_for(StoreKind::DidProfile)
+            ]),
+            "our own launcher is stamped with our owner hint and kind"
+        );
+        assert_eq!(
+            memos_of(foreign_coin.amount),
+            Some(vec![digstore_owner_hint(foreign_owner_ph)]),
+            "the foreign launcher passes through with exactly the memos it arrived with"
+        );
+        Ok(())
     }
 
     /// The MEASUREMENT the even-amount guard rests on: an even-amount launch is ACCEPTED on chain,
