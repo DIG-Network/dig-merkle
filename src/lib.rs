@@ -121,3 +121,8 @@ pub use update::update_root;
 // Re-export the signing types a consumer needs to CALL [`required_signatures`] and consume its
 // result, so a downstream crate need not add a direct chia-wallet-sdk dependency for them.
 pub use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature};
+
+// Re-export the two launcher builders a consumer needs to CALL
+// [`mint_datastore_launch_with_kind`], for the same reason: `Launcher::new(parent_coin_id, 1)` for an
+// ordinary parent, `IntermediateLauncher::new(parent_coin_id, 0, 1).create(ctx)?` for a singleton one.
+pub use chia_wallet_sdk::driver::{IntermediateLauncher, Launcher};

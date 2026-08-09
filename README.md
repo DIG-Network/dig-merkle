@@ -101,13 +101,27 @@ on-chain. It is the default behaviour, verified by a golden test.
 
 A DIG store can be rooted in a DID **without a `dig-did` dependency**. The composable path is:
 
-1. Call `mint_datastore_launch_with_kind(&mut ctx, parent_coin, ..)` — this stages the launcher and
-   eve-DataStore spends into `ctx` and returns a `DatastoreLaunch` whose `parent_conditions` carry
-   the launcher `CREATE_COIN` (and its coin-announcement assertion) that the DID-authorized parent
-   spend **must** emit.
-2. Build your DID-authorized parent-coin spend on the **same** `ctx`, folding in
+1. Build the launcher for your parent's shape. A DID is a **singleton**, whose inner puzzle may emit
+   exactly ONE odd-amount `CREATE_COIN` — its own successor — so it cannot create the 1-mojo launcher
+   directly; the bundle would build cleanly and be rejected on chain. Interpose an intermediate coin:
+   `IntermediateLauncher::new(did.coin.coin_id(), 0, 1).create(&mut ctx)?`. (An ordinary, non-singleton
+   parent uses `Launcher::new(parent_coin.coin_id(), 1)`.) Both are re-exported here.
+2. Call `mint_datastore_launch_with_kind(&mut ctx, kind, launcher, ..)` — this stages the launcher and
+   eve-DataStore spends into `ctx` and returns a `DatastoreLaunch` whose `parent_conditions` carry the
+   `CREATE_COIN` that starts the launch (the intermediate coin, or the launcher itself for a direct
+   launch) plus the announcement assertions that the DID-authorized parent spend **must** emit.
+3. Build your DID-authorized parent-coin spend on the **same** `ctx`, folding in
    `DatastoreLaunch::parent_conditions`.
-3. Drain `ctx` once to get the complete spend bundle.
+4. Drain `ctx` once to get the complete spend bundle.
+
+The launcher is created at 1 mojo by a **zero-amount** intermediate, so the bundle must carry that
+mojo from another spend; Chia balances a bundle in aggregate, not per coin.
+
+The two-memo owner-discovery hint lives on the launcher `CREATE_COIN`, which an intermediate launch
+emits from its own fixed puzzle — so a store launched this way carries **no launcher memos** and is
+not found by a launcher-memo scan. It is discovered by `resolve_owner_did` instead (below). A caller
+that needs both the memos and a DID root interposes its own ordinary coin, created at an even amount
+by the DID, and launches directly from that.
 
 `mint_datastore_with_kind` (the all-in-one wrapper) accepts only `Owner::Standard` and rejects
 `Owner::Custom` with `MerkleError::UnsupportedOwner` — use the composable API above for DID-rooted
@@ -119,7 +133,7 @@ interface BELOW dig-merkle, for §3.7 — pending its crates.io publish).
 
 A store rooted in a DID (minted via the composable path above) can be identified on-chain.
 To recover the owning DID back from chain, `resolve_owner_did` walks the store's
-launcher lineage one hop up and recognises a DID creator — delegating ALL chain reads to a
+launcher lineage up (one hop, or two through an intermediate-launcher coin) and recognises a DID creator — delegating ALL chain reads to a
 caller-supplied `ChainSource` (the canonical `dig_chainsource_interface::ChainSource`), so dig-merkle
 stays network-free (INV-1):
 

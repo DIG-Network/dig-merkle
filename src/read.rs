@@ -1,17 +1,17 @@
 //! Reading on-chain DataLayer state without spending (SPEC §3.6/§3.7) — owner-DID discovery.
 //!
-//! A DIG store can be rooted in a DID: the store's launcher coin is created by spending a
-//! DID-authorized parent coin whose spend emits the launcher `CREATE_COIN` obtained from
-//! [`crate::DatastoreLaunch::parent_conditions`] (returned by
-//! [`crate::mint_datastore_launch_with_kind`]). This module
-//! recovers that owning DID by walking the store's launcher lineage one hop up to its creator and
-//! recognising a DID coin spend.
+//! A DIG store can be rooted in a DID: the store's launcher coin descends from a DID-authorized
+//! parent coin whose spend emits [`crate::DatastoreLaunch::parent_conditions`] (returned by
+//! [`crate::mint_datastore_launch_with_kind`]). A DID is a singleton, so it cannot parent the
+//! odd-amount launcher directly and interposes an even-amount intermediate coin (SPEC §3.1a). This
+//! module recovers the owning DID by walking the store's launcher lineage up — one hop, or two
+//! through that intermediate — and recognising a DID coin spend.
 //!
 //! ## Two layers
 //!
 //! [`did_ref_from_spend`] is the pure, network-free core — it recognises a DID from a single coin
-//! spend. [`resolve_owner_did`] is the launcher-lineage WALK on top: it fetches the two coin spends
-//! (`store_id` → its creator) through the injected CANONICAL
+//! spend. [`resolve_owner_did`] is the launcher-lineage WALK on top: it fetches the coin spends
+//! (`store_id` → its creator, and at most one hop beyond) through the injected CANONICAL
 //! [`dig_chainsource_interface::ChainSource`] read interface (a reference-DOWN pure leaf) and passes
 //! the creator spend to `did_ref_from_spend`, fail-closed to `Ok(None)` at every missing hop.
 //! dig-merkle itself opens no socket (INV-1) — the caller implements the chain read.
@@ -404,7 +404,7 @@ mod tests {
             alice.puzzle_hash,
             vec![],
         )?;
-        did.update(ctx, &alice_p2, launch.parent_conditions.clone())?;
+        let _child = did.update(ctx, &alice_p2, launch.parent_conditions.clone())?;
 
         // The intermediate coin is created at 0 mojos, so the launcher's mojo comes from elsewhere.
         let funder = sim.bls(1);
@@ -469,7 +469,7 @@ mod tests {
         // A real intermediate launcher parented to that ordinary coin.
         let intermediate = IntermediateLauncher::new(ordinary_coin.coin_id(), 0, 1);
         let launcher_coin = intermediate.launcher_coin();
-        intermediate.create(ctx)?;
+        let _launcher = intermediate.create(ctx)?;
         let intermediate_spend = ctx
             .take()
             .into_iter()

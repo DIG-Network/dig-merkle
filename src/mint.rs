@@ -57,12 +57,14 @@ const SINGLETON_LAUNCHER_HASH: Bytes32 = Bytes32::new(hex!(
 ///
 /// # DID composition
 ///
-/// dig-merkle never depends on `dig-did`. To root a store in a DID, do NOT use this function: the
-/// conditions the DID coin's spend must emit (the launcher `CREATE_COIN` and its announcement
-/// assertion) are produced *inside* this call, so no pre-built inner spend can contain them. Use
-/// [`mint_datastore_launch_with_kind`] instead — it returns those conditions as
-/// [`DatastoreLaunch::parent_conditions`], which the caller folds into its own DID-authorized parent
-/// spend. The launcher then descends from the DID coin with no `dig-did` coupling here.
+/// dig-merkle never depends on `dig-did`. To root a store in a DID, do NOT use this function: it
+/// parents the launcher directly to `parent_coin`, and a DID is a singleton, whose inner puzzle may
+/// emit exactly ONE odd-amount `CREATE_COIN` — its own successor. A 1-mojo launcher alongside that
+/// recreation is a second odd output, so the bundle is REJECTED on chain. Use
+/// [`mint_datastore_launch_with_kind`] with an `IntermediateLauncher` instead; it returns the
+/// conditions the DID's own spend must emit as [`DatastoreLaunch::parent_conditions`], and the
+/// launcher descends from the DID through an even-amount intermediate coin with no `dig-did`
+/// coupling here.
 ///
 /// # Signing
 ///
@@ -1140,7 +1142,7 @@ mod tests {
         let intermediate_coin = intermediate.intermediate_coin();
         let launcher = intermediate.create(ctx)?;
         let launch = launch_from_singleton(ctx, launcher, owner_ph, |ctx, conditions| {
-            did.update(ctx, &alice_p2, conditions)?;
+            let _child = did.update(ctx, &alice_p2, conditions)?;
             Ok(())
         })?;
 
@@ -1209,7 +1211,7 @@ mod tests {
         let did_coin_id = did.coin.coin_id();
         let launcher = Launcher::new(did_coin_id, 1);
         let _launch = launch_from_singleton(ctx, launcher, owner_ph, |ctx, conditions| {
-            did.update(ctx, &alice_p2, conditions)?;
+            let _child = did.update(ctx, &alice_p2, conditions)?;
             Ok(())
         })?;
 

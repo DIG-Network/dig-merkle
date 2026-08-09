@@ -143,7 +143,7 @@ pub struct DatastoreLaunch {
 }
 
 pub fn mint_datastore_launch_with_kind(
-    ctx: &mut SpendContext, kind: StoreKind, parent_coin_id: Bytes32, root_hash: Bytes32,
+    ctx: &mut SpendContext, kind: StoreKind, launcher: Launcher, root_hash: Bytes32,
     label: Option<String>, description: Option<String>, size_proof: Option<String>,
     program_hash: Option<Bytes32>, size_bucket: Option<SizeBucket>,
     owner_puzzle_hash: Bytes32, delegated_puzzles: Vec<DelegatedPuzzle>,
@@ -158,10 +158,37 @@ assertion) — no change and no fee, which belong to whoever pays.
   allocator that built them, and the launcher-coin and eve-DataStore spends are staged into that same
   context.
 - The function MUST NOT drain the context. The caller adds its parent-coin spend and drains ONCE.
-- The returned `parent_conditions` MUST contain a `CREATE_COIN` to the singleton launcher puzzle hash;
-  otherwise the call fails closed with `MerkleError::Chain`.
 - `mint_datastore_with_kind` is defined as this function plus a standard-p2 parent spend carrying the
   change, so both paths emit identical bytes.
+
+**The launcher is the CALLER's, because the legal shape depends on the parent (#2418).** The launch
+composition MUST be one of exactly two shapes, and the function verifies before returning that the
+built `parent_conditions` actually reach `launcher.coin()`, failing closed with `MerkleError::Chain`
+otherwise:
+
+1. **Direct — an ORDINARY (non-singleton) parent.** `Launcher::new(parent_coin.coin_id(), 1)`. The
+   `parent_conditions` contain the launcher `CREATE_COIN` itself, and the two-memo owner-discovery
+   hint (§9) is written onto it. This is what `mint_datastore_with_kind` uses.
+2. **Via an intermediate — a SINGLETON parent** (a DID, another DataStore, a vault singleton).
+   `IntermediateLauncher::new(parent_coin.coin_id(), 0, 1).create(ctx)?`. The `parent_conditions`
+   contain a `CREATE_COIN` for a ZERO-amount intermediate coin, whose own (already staged) spend
+   creates the 1-mojo launcher. Verified by RUNNING that staged spend and checking the coin it
+   creates IS `launcher.coin()`.
+
+A singleton's inner puzzle MAY emit exactly ONE odd-amount `CREATE_COIN` — its own successor — so
+shape 1 from a singleton parent builds cleanly and is REJECTED on chain (a CLVM raise). Shape 2 is
+therefore MANDATORY for a singleton parent, and shape 1 MUST NOT be used with one.
+
+**A launcher created via an intermediate carries NO owner-discovery memos.** The two-memo hint lives
+on the launcher `CREATE_COIN`, which under shape 2 is emitted by the intermediate coin's own fixed
+puzzle; dig-merkle cannot write memos onto it. Such a store is NOT discoverable by a launcher-memo
+scan (§9) and — this includes its `StoreKind` discriminator — is discovered by the §3.7 lineage walk
+instead. A caller needing BOTH the memos and a singleton root MUST interpose its own ordinary coin,
+created at an even amount by the singleton, and launch from it with shape 1.
+
+**Bundle balance.** Under shape 2 a zero-amount coin creates a 1-mojo launcher, so the surrounding
+spend bundle MUST supply that mojo from another spend. Chia balances a bundle in aggregate, not per
+coin; a bundle without the surplus is rejected as a minting coin.
 
 Returns `MerkleCoinSpend { coin_spends: [launcher spend, parent/owner spend], child: Some(eve
 DataStore) }`, unsigned (INV-3). **Signing:** an `Owner::Standard` mint requires exactly one
@@ -227,10 +254,22 @@ creator as a DID:
    `Ok(None)`.
 2. `parent_id = launcher_spend.coin.parent_coin_info` — the coin that created the launcher.
 3. `chain.coin_spend(parent_id)?` → the creator's spend. Missing → `Ok(None)`.
-4. `did_ref_from_spend(&parent_spend)` → `Some(DidRef{launcher_id})` if the creator was a DID, else
-   `Ok(None)`.
+4. `did_ref_from_spend(&creator_spend)` → `Some(DidRef{launcher_id})` if the creator was a DID.
+5. Otherwise, IF the creator is the intermediate-launcher coin of a singleton-parent launch (§3.1a),
+   ONE further hop: `chain.coin_spend(creator_spend.coin.parent_coin_info)` →
+   `did_ref_from_spend(..)`. Missing → `Ok(None)`.
 
-It is **fail-closed to `Ok(None)`** at every missing/non-DID step (never an error for "not
+**The walk is BOUNDED at two creator hops, and the second MUST be earned.** A singleton parent
+interposes an intermediate coin (§3.1a), so the DID sits two hops above the launcher; without step 5
+a DID-rooted store resolves as NOT DID-owned. Step 5 MUST NOT be a general parent walk: an unbounded
+climb over coin records an untrusted `ChainSource` controls is a DoS, and it would attribute an
+ordinary store to a DID that merely created its funding coin. The step is taken ONLY when the creator
+is STRUCTURALLY that intermediate — a coin of amount 0 whose spend creates exactly ONE coin, and that
+coin IS this store's launcher (identity by full coin id). Recognition is by shape, not by puzzle hash,
+so it holds for any `mint_number`/`mint_total`. Anything else, and any parse or evaluation failure,
+stops the walk at `Ok(None)`. A DID three or more hops above the launcher is NOT reported.
+
+It is **fail-closed to `Ok(None)`** at every missing/non-DID/unexpected step (never an error for "not
 DID-owned") and **READ-ONLY** — it never signs, spends, or broadcasts. All chain access is delegated
 to the caller-supplied `ChainSource`, the CANONICAL `dig_chainsource_interface::ChainSource` read
 interface — a reference-DOWN pure leaf crate below dig-merkle, NOT a local trait — with the single
@@ -280,8 +319,9 @@ consensus against (`AssertMyParentIdFailed`).
 
 **Launcher-lineage discovery (§3.7).** Owner-DID discovery is the same fail-closed principle applied
 to a READ: `resolve_owner_did` walks the launcher lineage via the injected `ChainSource`
-(`coin_spend(store_id)` → its `parent_coin_info` → `coin_spend(parent)`) and recognises a DID creator
-with `did_ref_from_spend`. Any missing spend, or a non-DID creator, yields `Ok(None)` — never a
+(`coin_spend(store_id)` → its `parent_coin_info` → `coin_spend(parent)`, plus at most one further hop
+through an intermediate-launcher coin) and recognises a DID creator with `did_ref_from_spend`. Any
+missing spend, or a non-DID creator the walk may not climb past, yields `Ok(None)` — never a
 fabricated result and never an error for "not DID-owned".
 
 **Store-id binding is MANDATORY per hop (NC-9).** The injected `ChainSource` is trusted only to
@@ -291,8 +331,8 @@ valid, DID-rooted launcher. `resolve_owner_did` therefore binds every hop to the
 and fails CLOSED on any mismatch — it MUST NOT return a `Some(DidRef)` it cannot bind to `store_id`:
 - The launcher spend returned for `store_id` MUST satisfy `launcher_spend.coin.coin_id() == store_id`
   (a DIG store id IS its launcher coin id). A mismatch is rejected with `Err(MerkleError::Chain)`.
-- The creator spend returned for `parent_id` MUST satisfy `creator_spend.coin.coin_id() == parent_id`
-  (the creator is the launcher's parent). A mismatch is rejected with `Err(MerkleError::Chain)`.
+- EVERY creator spend returned for a `coin_id` MUST satisfy `spend.coin.coin_id() == coin_id`,
+  including the second hop's. A mismatch is rejected with `Err(MerkleError::Chain)`.
 A substituted answer is deliberately surfaced as `Err(Chain)`, not `Ok(None)`, so a hostile-source
 substitution is distinguishable from a genuinely non-DID-owned store.
 
