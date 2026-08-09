@@ -1351,15 +1351,16 @@ mod tests {
     /// simulator. A Chia singleton's inner puzzle may emit exactly ONE odd-amount `CREATE_COIN` — its
     /// own successor — so the 1-mojo launcher is a second odd output and the bundle raises.
     ///
-    /// Everything except the launcher shape is identical to the accepted case, AND the assertion
-    /// pins the specific CLVM raise — the two together are what make this discriminating. Neither
-    /// alone is: a bare `is_err()` also passes with the funder removed, with the signing key removed,
-    /// and even on the LEGAL intermediate shape, so it would report "something went wrong" rather
-    /// than "the chain rejects this shape".
+    /// The test is a DIFFERENCE of exactly one variable, asserted from both sides: the direct shape
+    /// must raise, and the otherwise-identical intermediate shape must be accepted. Both halves are
+    /// needed. A bare `is_err()` on the negative half alone also passes on the LEGAL intermediate
+    /// shape, reporting "something went wrong" rather than "the chain rejects this shape"; and the
+    /// negative half is structurally blind to the funder and the signing keys, because the raise
+    /// precedes both checks — only the positive half exercises those.
     #[test]
     fn a_launcher_parented_directly_to_a_singleton_is_rejected_on_chain() -> anyhow::Result<()> {
         use chia_wallet_sdk::clvmr::error::EvalErr;
-        use chia_wallet_sdk::driver::StandardLayer;
+        use chia_wallet_sdk::driver::{IntermediateLauncher, StandardLayer};
         use chia_wallet_sdk::signer::SignerError;
         use chia_wallet_sdk::test::SimulatorError;
 
@@ -1386,15 +1387,20 @@ mod tests {
 
         let result = sim.spend_coins(ctx.take(), &[alice.sk.clone(), funder.sk.clone()]);
 
-        // Pin the SPECIFIC failure, never a bare `is_err()`. A generic error assertion passes on the
-        // very compositions this control exists to distinguish itself from — an unfunded bundle
-        // (`Validation`), an unsigned one (`MissingKey`), or even the LEGAL intermediate shape — so
-        // it would prove "something went wrong", not "the chain rejects this shape".
+        // Pin the SPECIFIC failure, never a bare `is_err()`. A generic error assertion also passes on
+        // the LEGAL intermediate shape, so it would prove "something went wrong" rather than "the
+        // chain rejects THIS shape".
         //
         // The singleton's inner puzzle enforces the one-odd-`CREATE_COIN` rule with a CLVM `(x)`, so
         // the intended rejection surfaces as a raise from the puzzle itself. That is the narrowest
         // pin available: the simulator reports the raise, not which of the puzzle's assertions
         // raised.
+        //
+        // Note what this half CANNOT see. The raise happens during puzzle evaluation, which precedes
+        // both signature verification and the bundle-balance check, so removing the funder spend or
+        // a signing key leaves the returned error byte-identical — no assertion on `result`, however
+        // narrow, could distinguish them. The positive control below is what makes those inputs
+        // load-bearing.
         assert!(
             matches!(
                 result,
@@ -1403,6 +1409,33 @@ mod tests {
             "a 1-mojo launcher emitted directly by a singleton is a second odd CREATE_COIN and must \
              be rejected by a CLVM raise from the singleton puzzle, but got: {result:?}"
         );
+
+        // POSITIVE CONTROL, same fixture, ONE variable changed: the identical launch through an
+        // even-amount intermediate is ACCEPTED. This is what makes the comparison a difference of
+        // launcher shape rather than a difference of "anything at all went wrong" — and, because the
+        // accepted bundle genuinely needs the funder mojo and both signatures, it is also what makes
+        // those two inputs load-bearing on a test whose negative half is blind to them.
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let alice = sim.bls(1_000_000);
+        let alice_p2 = StandardLayer::new(alice.pk);
+        let owner_ph: Bytes32 = StandardArgs::curry_tree_hash(alice.pk).into();
+
+        let (create_did, did) =
+            Launcher::new(alice.coin.coin_id(), 1).create_simple_did(ctx, &alice_p2)?;
+        alice_p2.spend(ctx, alice.coin, create_did)?;
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+
+        let launcher = IntermediateLauncher::new(did.coin.coin_id(), 0, 1).create(ctx)?;
+        let _launch = launch_from_singleton(ctx, launcher, owner_ph, |ctx, conditions| {
+            let _child = did.update(ctx, &alice_p2, conditions)?;
+            Ok(())
+        })?;
+        let funder = sim.bls(1);
+        StandardLayer::new(funder.pk).spend(ctx, funder.coin, Conditions::new())?;
+
+        sim.spend_coins(ctx.take(), &[alice.sk.clone(), funder.sk.clone()])
+            .expect("the intermediate shape is the legal one and must be accepted");
         Ok(())
     }
 
