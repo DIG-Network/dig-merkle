@@ -73,7 +73,9 @@ metadata updater). Its structure:
   - `Writer(TreeHash)` — may update the root but not the delegation set.
   - `Oracle(Bytes32, u64)` — anyone may spend the coin to read it, paying the fixed fee.
 - **The owner** is the standard p2 (`Owner::Standard`) or a custom inner puzzle (`Owner::Custom`,
-  e.g. a DID-authorized delegated puzzle) that guards spending.
+  e.g. a DID-authorized delegated puzzle) that guards spending. `Owner::Custom` carries its own
+  conditions, so it is valid only for operations whose conditions the caller can build in advance —
+  the mint path rejects it (§3.1).
 
 Spending the coin recreates it as its child with a (possibly) new root, delegation set, or owner —
 or melts it (no child). This is the DIG anchor: publishing a new capsule root is a DataLayer update
@@ -101,9 +103,12 @@ size bucket (CLVM key `sz`). The returned `MerkleCoinSpend.child` is a `DataStor
 Launches a new DataLayer store singleton over `chia_wallet_sdk::driver::Launcher::mint_datastore`
 (INV-4). `parent_coin` funds AND parents the launcher: its `coin_id` becomes the launcher's parent,
 so `launcher_id == store_id` derives from it. Taking a `parent_coin` (not a full launcher) lets a
-DID-authorized launcher built by `dig-did` compose here **without a `dig-did` dependency** — pass the
-DID coin as `parent_coin` with an `Owner::Custom` inner spend; the edge stays one-way
-(dig-identity → dig-merkle).
+DID-authorized launch composed by a caller work here **without a `dig-did` dependency**; the edge
+stays one-way (dig-identity → dig-merkle). A DID-rooted launch does NOT use `mint_datastore_with_kind`
+with an `Owner::Custom` inner spend — that variant emits only the conditions the caller baked in, and
+the launch conditions are built inside this call. `mint_datastore_with_kind` therefore REJECTS
+`Owner::Custom` with `MerkleError::UnsupportedOwner`; a custom-owner caller uses
+`mint_datastore_launch_with_kind` (§3.1a).
 
 The construction, byte-for-byte:
 
@@ -124,8 +129,39 @@ The construction, byte-for-byte:
    **implicitly** as (coins in − coins out) — there is NO explicit `RESERVE_FEE`, matching the
    on-chain producers. The `fee + 1` reservation is a CHECKED add: a `fee` so large that `fee + 1`
    would overflow `u64::MAX` fails closed with `MerkleError::Chain` rather than wrapping around.
-4. `parent_coin` is spent with `owner`'s inner puzzle (`Owner::Standard` → `StandardLayer`;
-   `Owner::Custom` → the caller's pre-built inner spend).
+4. `parent_coin` is spent with `owner`'s inner puzzle (`Owner::Standard` → `StandardLayer`). An
+   `Owner::Custom` mint is REJECTED at step 0 with `MerkleError::UnsupportedOwner`, before any
+   construction: a pre-built inner spend cannot emit the conditions built in step 1, so accepting it
+   would return a bundle that never creates the launcher coin.
+
+### §3.1a `mint_datastore_launch_with_kind` — the composable launch
+
+```rust
+pub struct DatastoreLaunch {
+    pub parent_conditions: Conditions,
+    pub datastore: DataStore<DigDataStoreMetadata>,
+}
+
+pub fn mint_datastore_launch_with_kind(
+    ctx: &mut SpendContext, kind: StoreKind, parent_coin_id: Bytes32, root_hash: Bytes32,
+    label: Option<String>, description: Option<String>, size_proof: Option<String>,
+    program_hash: Option<Bytes32>, size_bucket: Option<SizeBucket>,
+    owner_puzzle_hash: Bytes32, delegated_puzzles: Vec<DelegatedPuzzle>,
+) -> MerkleResult<DatastoreLaunch>;
+```
+
+Performs steps 1–2 above into the CALLER's `ctx` and returns the conditions the caller's parent-coin
+spend MUST emit (the launcher `CREATE_COIN` with the two memos, plus the launcher's coin-announcement
+assertion) — no change and no fee, which belong to whoever pays.
+
+- The `ctx` MUST be the caller's own: `Conditions` hold CLVM node pointers valid only in the
+  allocator that built them, and the launcher-coin and eve-DataStore spends are staged into that same
+  context.
+- The function MUST NOT drain the context. The caller adds its parent-coin spend and drains ONCE.
+- The returned `parent_conditions` MUST contain a `CREATE_COIN` to the singleton launcher puzzle hash;
+  otherwise the call fails closed with `MerkleError::Chain`.
+- `mint_datastore_with_kind` is defined as this function plus a standard-p2 parent spend carrying the
+  change, so both paths emit identical bytes.
 
 Returns `MerkleCoinSpend { coin_spends: [launcher spend, parent/owner spend], child: Some(eve
 DataStore) }`, unsigned (INV-3). **Signing:** an `Owner::Standard` mint requires exactly one

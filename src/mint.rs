@@ -22,7 +22,7 @@ use crate::context::{drain_coin_spends, inner_spend};
 use crate::hint::{digstore_owner_hint, launcher_hint_for, StoreKind};
 use crate::metadata::DigDataStoreMetadata;
 use crate::size::SizeBucket;
-use crate::types::{Bytes32, Coin, DelegatedPuzzle, MerkleCoinSpend, Owner};
+use crate::types::{Bytes32, Coin, DataStore, DelegatedPuzzle, MerkleCoinSpend, Owner};
 use crate::{MerkleError, MerkleResult};
 
 /// The well-known singleton launcher puzzle hash. A `CREATE_COIN` to this puzzle hash mints the
@@ -56,9 +56,12 @@ const SINGLETON_LAUNCHER_HASH: Bytes32 = Bytes32::new(hex!(
 ///
 /// # DID composition
 ///
-/// dig-merkle never depends on `dig-did`. To root a store in a DID, pass the DID-authorized coin as
-/// `parent_coin` with an [`Owner::Custom`] inner spend that satisfies the DID's puzzle — the launcher
-/// then descends from the DID coin with no `dig-did` coupling here.
+/// dig-merkle never depends on `dig-did`. To root a store in a DID, do NOT use this function: the
+/// conditions the DID coin's spend must emit (the launcher `CREATE_COIN` and its announcement
+/// assertion) are produced *inside* this call, so no pre-built inner spend can contain them. Use
+/// [`mint_datastore_launch_with_kind`] instead — it returns those conditions as
+/// [`DatastoreLaunch::parent_conditions`], which the caller folds into its own DID-authorized parent
+/// spend. The launcher then descends from the DID coin with no `dig-did` coupling here.
 ///
 /// # Signing
 ///
@@ -110,6 +113,13 @@ pub fn mint_datastore(
 /// existing on-chain stores; [`StoreKind::DidProfile`] emits the DID-profile discriminator instead.
 /// The first launcher memo is always the kind-agnostic owner hint. See [`mint_datastore`] for the
 /// full argument, DID-composition, signing, and error semantics.
+///
+/// # Errors
+///
+/// Returns [`MerkleError::UnsupportedOwner`] for [`Owner::Custom`]: this function builds the launch
+/// conditions itself, so a pre-built inner spend cannot possibly emit them (it would return a bundle
+/// that never creates the launcher coin). Custom owners compose the launch via
+/// [`mint_datastore_launch_with_kind`].
 #[allow(clippy::too_many_arguments)]
 pub fn mint_datastore_with_kind(
     kind: StoreKind,
@@ -125,29 +135,32 @@ pub fn mint_datastore_with_kind(
     delegated_puzzles: Vec<DelegatedPuzzle>,
     fee: u64,
 ) -> MerkleResult<MerkleCoinSpend> {
+    if matches!(owner, Owner::Custom(_)) {
+        return Err(MerkleError::UnsupportedOwner(
+            "a launch's parent conditions are built inside this call, so Owner::Custom cannot emit \
+             them — use mint_datastore_launch_with_kind and compose the parent spend yourself",
+        ));
+    }
+
     let mut ctx = SpendContext::new();
 
-    // Build the launcher + eve DataStore via the SDK (the byte-source-of-truth, INV-4). The returned
-    // `launch_conditions` are what the funding coin must emit to create the launcher coin.
-    let (launch_conditions, datastore) = Launcher::new(parent_coin.coin_id(), 1).mint_datastore(
+    // ONE code path with the caller-composed launch (below), so byte identity is structural.
+    let DatastoreLaunch {
+        parent_conditions: launch_conditions,
+        datastore,
+    } = mint_datastore_launch_with_kind(
         &mut ctx,
-        DigDataStoreMetadata {
-            root_hash,
-            label,
-            description,
-            size_proof,
-            program_hash,
-            size_bucket,
-        },
-        owner_puzzle_hash.into(),
+        kind,
+        parent_coin.coin_id(),
+        root_hash,
+        label,
+        description,
+        size_proof,
+        program_hash,
+        size_bucket,
+        owner_puzzle_hash,
         delegated_puzzles,
     )?;
-
-    // Override the launcher CREATE_COIN memos to the two-memo owner-discovery hint (SPEC §9). This is
-    // the byte-identity requirement: the raw SDK mint emits only a single default hint, which matches
-    // no store already on chain.
-    let launch_conditions =
-        override_launcher_hint(&mut ctx, launch_conditions, owner_puzzle_hash, kind)?;
 
     // Return the parent coin's surplus (above the 1-mojo launcher + `fee`) to the owner as change,
     // hinted to their puzzle hash. The fee is thereby paid implicitly (coins in minus coins out).
@@ -173,6 +186,112 @@ pub fn mint_datastore_with_kind(
         drain_coin_spends(&mut ctx),
         Some(datastore),
     ))
+}
+
+/// Everything a DataLayer launch needs EXCEPT the parent-coin spend.
+///
+/// `parent_conditions` are allocated in the [`SpendContext`] passed to
+/// [`mint_datastore_launch_with_kind`] and are valid ONLY in that context — `Conditions` holds CLVM
+/// node pointers that index into the allocator that built them. The launcher-coin and eve-DataStore
+/// spends are already staged into that same context; the caller adds its parent-coin spend and drains
+/// the context ONCE, at the end.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct DatastoreLaunch {
+    /// What the parent coin's spend must emit: the launcher `CREATE_COIN` carrying the two DIG
+    /// owner-discovery memos, plus the launcher's coin-announcement assertion. No change, no fee —
+    /// those belong to whoever pays, and the caller adds them to its own spend.
+    pub parent_conditions: Conditions,
+
+    /// The eve DataStore as it will exist once the launch confirms.
+    pub datastore: DataStore<DigDataStoreMetadata>,
+}
+
+/// Builds a DataLayer launch into the CALLER's [`SpendContext`], returning the conditions the
+/// caller's parent-coin spend must emit (SPEC §3.1).
+///
+/// This is the composable half of [`mint_datastore_with_kind`]: it stages the launcher-coin and
+/// eve-DataStore spends into `ctx` and hands back the parent conditions, leaving the caller free to
+/// authorize the parent coin however it likes — a DID-authorized spend, a vault, a multisig — and to
+/// add its own change and fee. `mint_datastore_with_kind` is exactly this function plus a standard-p2
+/// parent spend, so both paths emit identical bytes by construction.
+///
+/// # The context is the caller's, and this function does NOT drain it
+///
+/// `ctx` MUST be the same context the caller will build its parent spend in and drain: the returned
+/// [`Conditions`] hold node pointers into that allocator, and the launcher/eve coin spends are staged
+/// there. Draining here would strand them. The caller's sequence is: call this, add its parent spend
+/// via `ctx.spend(..)`, then drain once.
+///
+/// # Errors
+///
+/// Returns [`MerkleError::Driver`] if the SDK fails to construct the launcher, and
+/// [`MerkleError::Chain`] if the built conditions do not create the launcher coin — a fail-closed
+/// class guard, so an unlaunchable bundle can never be returned as a success.
+#[allow(clippy::too_many_arguments)]
+pub fn mint_datastore_launch_with_kind(
+    ctx: &mut SpendContext,
+    kind: StoreKind,
+    parent_coin_id: Bytes32,
+    root_hash: Bytes32,
+    label: Option<String>,
+    description: Option<String>,
+    size_proof: Option<String>,
+    program_hash: Option<Bytes32>,
+    size_bucket: Option<SizeBucket>,
+    owner_puzzle_hash: Bytes32,
+    delegated_puzzles: Vec<DelegatedPuzzle>,
+) -> MerkleResult<DatastoreLaunch> {
+    // Build the launcher + eve DataStore via the SDK (the byte-source-of-truth, INV-4). The returned
+    // conditions are what the parent coin must emit to create the launcher coin.
+    let (launch_conditions, datastore) = Launcher::new(parent_coin_id, 1).mint_datastore(
+        ctx,
+        DigDataStoreMetadata {
+            root_hash,
+            label,
+            description,
+            size_proof,
+            program_hash,
+            size_bucket,
+        },
+        owner_puzzle_hash.into(),
+        delegated_puzzles,
+    )?;
+
+    // Override the launcher CREATE_COIN memos to the two-memo owner-discovery hint (SPEC §9). This is
+    // the byte-identity requirement: the raw SDK mint emits only a single default hint, which matches
+    // no store already on chain.
+    let parent_conditions =
+        override_launcher_hint(ctx, launch_conditions, owner_puzzle_hash, kind)?;
+
+    #[cfg(test)]
+    let parent_conditions = tests::drop_launcher_if_armed(parent_conditions);
+
+    assert_creates_launcher(&parent_conditions)?;
+
+    Ok(DatastoreLaunch {
+        parent_conditions,
+        datastore,
+    })
+}
+
+/// Fails closed unless `conditions` create the launcher coin.
+///
+/// The `Owner::Custom` refusal catches the one known way to lose the launcher; this catches the
+/// CLASS — an `override_launcher_hint` regression, a delegated-puzzle path, a future `Owner` variant.
+/// It reads the already-parsed [`Conditions`] (O(n), no allocation, no CLVM re-run), so it costs
+/// nothing to keep on the hot path.
+fn assert_creates_launcher(conditions: &Conditions) -> MerkleResult<()> {
+    let creates_launcher = conditions.iter().any(|condition| {
+        matches!(condition, Condition::CreateCoin(cc) if cc.puzzle_hash == SINGLETON_LAUNCHER_HASH)
+    });
+    if creates_launcher {
+        Ok(())
+    } else {
+        Err(MerkleError::Chain(
+            "launch conditions do not create the launcher coin".into(),
+        ))
+    }
 }
 
 /// Rewrites the launcher `CREATE_COIN` in `conditions` to carry the two owner-discovery memos.
@@ -660,6 +779,201 @@ mod tests {
             "the size bucket survives the on-chain roundtrip"
         );
         Ok(())
+    }
+
+    // Arms `drop_launcher_if_armed` for the duration of one test, so the class-level launcher guard
+    // can be OBSERVED failing (an assertion never seen to fail is decoration). THREAD-local, never a
+    // global: the harness runs tests in parallel, and a global flag would arm the seam under
+    // unrelated tests.
+    thread_local! {
+        static DROP_LAUNCHER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Test-only seam: when armed, strips the launcher `CREATE_COIN` from the built launch
+    /// conditions, simulating a future regression in [`override_launcher_hint`] or a new code path
+    /// that loses it. Compiled out entirely in release builds.
+    pub(super) fn drop_launcher_if_armed(conditions: Conditions) -> Conditions {
+        if !DROP_LAUNCHER.with(std::cell::Cell::get) {
+            return conditions;
+        }
+        let mut kept = Conditions::new();
+        for condition in conditions {
+            let is_launcher = matches!(
+                &condition,
+                Condition::CreateCoin(cc) if cc.puzzle_hash == SINGLETON_LAUNCHER_HASH
+            );
+            if !is_launcher {
+                kept = kept.with(condition);
+            }
+        }
+        kept
+    }
+
+    /// REGRESSION (#2418): `mint_datastore_with_kind` used to DROP the launch conditions for an
+    /// [`Owner::Custom`] mint (`context::inner_spend` ignores `conditions` for that variant), so it
+    /// returned `Ok` with a bundle that never creates the launcher coin — reported as success after
+    /// the caller had already paid for the DID it was rooting from. The caller cannot supply those
+    /// conditions: they are produced inside this very call. It must refuse.
+    ///
+    /// The stand-in for a DID-authorized spend is a caller-built inner spend with EMPTY conditions —
+    /// exactly what a caller who cannot see the launch conditions constructs. (`dig-merkle` cannot
+    /// depend on `dig-did`: both are `10-primitives`, and a same-level edge is forbidden.)
+    #[test]
+    fn a_custom_owner_mint_does_not_silently_omit_the_launcher() {
+        use chia_wallet_sdk::driver::{SpendWithConditions, StandardLayer};
+
+        let mut ctx = SpendContext::new();
+        let (owner_pk, owner_ph) = seeded_owner();
+        let prebuilt = StandardLayer::new(owner_pk)
+            .spend_with_conditions(&mut ctx, Conditions::new())
+            .expect("a caller-built inner spend");
+        let parent = Coin::new(Bytes32::new([0x21; 32]), owner_ph, 1_000_000);
+
+        let result = mint_datastore_with_kind(
+            StoreKind::File,
+            parent,
+            Owner::Custom(prebuilt),
+            Bytes32::new([0xab; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            vec![],
+            1_000,
+        );
+
+        assert!(
+            matches!(result, Err(MerkleError::UnsupportedOwner(_))),
+            "a custom-owner mint must refuse, not return an unlaunchable bundle"
+        );
+    }
+
+    /// The class-level guard is FALSIFIABLE: with the test seam armed to drop the launcher
+    /// `CREATE_COIN`, the builder fails closed instead of handing back an unlaunchable launch.
+    #[test]
+    fn a_launch_without_the_launcher_coin_fails_closed() {
+        let (_owner_pk, owner_ph) = seeded_owner();
+        let mut ctx = SpendContext::new();
+
+        DROP_LAUNCHER.with(|armed| armed.set(true));
+        let result = mint_datastore_launch_with_kind(
+            &mut ctx,
+            StoreKind::File,
+            Bytes32::new([0x21; 32]),
+            Bytes32::new([0xab; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            vec![],
+        );
+        DROP_LAUNCHER.with(|armed| armed.set(false));
+
+        match result {
+            Err(MerkleError::Chain(message)) => assert_eq!(
+                message, "launch conditions do not create the launcher coin",
+                "the guard must name what it caught"
+            ),
+            other => panic!("expected a fail-closed Chain error, got {other:?}"),
+        }
+    }
+
+    /// The unarmed control: the very same call succeeds and DOES carry the launcher, so the test
+    /// above observed the guard rather than an unrelated failure.
+    #[test]
+    fn an_ordinary_launch_carries_the_launcher_coin() {
+        let (_owner_pk, owner_ph) = seeded_owner();
+        let mut ctx = SpendContext::new();
+
+        let launch = mint_datastore_launch_with_kind(
+            &mut ctx,
+            StoreKind::File,
+            Bytes32::new([0x21; 32]),
+            Bytes32::new([0xab; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            vec![],
+        )
+        .expect("an ordinary launch builds");
+
+        assert!(
+            launch.parent_conditions.iter().any(|condition| {
+                matches!(condition, Condition::CreateCoin(cc) if cc.puzzle_hash == SINGLETON_LAUNCHER_HASH)
+            }),
+            "the launch conditions create the launcher coin"
+        );
+    }
+
+    /// The composable path is the SAME path: a caller-composed launch plus an ordinary standard-p2
+    /// parent spend produces coin spends BYTE-IDENTICAL to [`mint_datastore_with_kind`]. This is what
+    /// makes "one code path" checkable rather than merely claimed.
+    #[test]
+    fn the_composed_launch_is_byte_identical_to_the_wrapper() {
+        let (owner_pk, owner_ph) = seeded_owner();
+        let parent = Coin::new(Bytes32::new([0x66; 32]), owner_ph, 1_000_000);
+        let root = Bytes32::new([0xab; 32]);
+        let fee = 1_000_u64;
+
+        let wrapper = mint_datastore_with_kind(
+            StoreKind::File,
+            parent,
+            Owner::Standard(owner_pk),
+            root,
+            Some("store".into()),
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            vec![],
+            fee,
+        )
+        .expect("wrapper mint builds");
+
+        // The caller's own composition: one context, launch staged into it, parent spend added, one
+        // drain at the end.
+        let mut ctx = SpendContext::new();
+        let launch = mint_datastore_launch_with_kind(
+            &mut ctx,
+            StoreKind::File,
+            parent.coin_id(),
+            root,
+            Some("store".into()),
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            vec![],
+        )
+        .expect("composed launch builds");
+        let change_hint = ctx.hint(owner_ph).expect("change hint");
+        let owner_conditions =
+            launch
+                .parent_conditions
+                .create_coin(owner_ph, parent.amount - (fee + 1), change_hint);
+        let owner_spend = inner_spend(&mut ctx, Owner::Standard(owner_pk), owner_conditions)
+            .expect("owner spend");
+        ctx.spend(parent, owner_spend).expect("parent spend");
+        let composed = drain_coin_spends(&mut ctx);
+
+        assert_eq!(
+            wrapper.coin_spends, composed,
+            "the wrapper is the composed launch plus a standard parent spend, byte for byte"
+        );
+        assert_eq!(
+            wrapper.child.expect("wrapper yields a datastore").info,
+            launch.datastore.info,
+            "both paths describe the same eve DataStore"
+        );
     }
 
     /// Regression (#1227): a `fee == u64::MAX` must fail closed with [`MerkleError::Chain`] rather

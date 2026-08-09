@@ -53,6 +53,12 @@ pub enum MerkleError {
     #[error("delegation permission denied: {0}")]
     Permission(String),
 
+    /// The operation cannot be authorized by the supplied [`crate::Owner`] variant, because the
+    /// conditions the spend must emit are produced inside the call and therefore cannot appear in a
+    /// pre-built inner spend. The message names the API to use instead.
+    #[error("unsupported owner: {0}")]
+    UnsupportedOwner(&'static str),
+
     /// A chain-level precondition was violated (e.g. a supplied coin does not match the expected
     /// launcher). The string states the specific violation.
     #[error("chain precondition failed: {0}")]

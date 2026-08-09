@@ -15,7 +15,10 @@ use crate::metadata::DigDataStoreMetadata;
 // the SDK's `chip-0035` feature) — dig-merkle adds no shadow copy (INV-4).
 pub use chia_protocol::{Bytes32, Coin, CoinSpend};
 pub use chia_puzzle_types::{LineageProof, Proof};
-pub use chia_wallet_sdk::driver::{DataStore, DataStoreInfo, DataStoreMetadata, DelegatedPuzzle};
+pub use chia_wallet_sdk::driver::{
+    DataStore, DataStoreInfo, DataStoreMetadata, DelegatedPuzzle, SpendContext,
+};
+pub use chia_wallet_sdk::types::Conditions;
 
 /// The result of building a DataLayer-coin operation: the unsigned coin spends plus the recreated
 /// child DataStore.
@@ -55,13 +58,17 @@ impl MerkleCoinSpend {
 ///   the `StandardLayer` for you; the resulting spend requires one `AGG_SIG_ME` over the given key.
 /// - [`Owner::Custom`] is the escape hatch — the caller supplies an already-built inner [`Spend`]
 ///   (any p2 puzzle: a custom vault, a multisig, a DID-authorized delegated puzzle). dig-merkle
-///   passes it through unchanged, so the caller owns its signature requirements.
+///   passes it through unchanged, so the caller owns its signature requirements AND the conditions
+///   the spend emits. It is therefore usable only for operations whose conditions the caller can
+///   construct in advance — NOT the mint path, whose launch conditions are built inside the call
+///   (see [`crate::mint_datastore_launch_with_kind`]).
 #[derive(Debug, Clone, Copy)]
 pub enum Owner {
     /// The standard single-key p2 puzzle, owned by the given (synthetic) public key.
     Standard(PublicKey),
 
-    /// A fully pre-built inner spend for a custom p2 puzzle, passed through unchanged.
+    /// A fully pre-built inner spend for a custom p2 puzzle, passed through unchanged — including
+    /// the conditions it emits, which dig-merkle can neither add to nor inspect.
     Custom(Spend),
 }
 

@@ -106,13 +106,15 @@ pub use hydrate::hydrate;
 pub use lineage::child_lineage_proof;
 pub use melt::melt;
 pub use metadata::DigDataStoreMetadata;
-pub use mint::{mint_datastore, mint_datastore_with_kind};
+pub use mint::{
+    mint_datastore, mint_datastore_launch_with_kind, mint_datastore_with_kind, DatastoreLaunch,
+};
 pub use read::{did_ref_from_spend, resolve_owner_did, DidRef};
 pub use sign::required_signatures;
 pub use size::SizeBucket;
 pub use types::{
-    Bytes32, Coin, CoinSpend, DataStore, DataStoreInfo, DataStoreMetadata, DelegatedPuzzle,
-    LineageProof, MerkleCoinSpend, Owner, Proof,
+    Bytes32, Coin, CoinSpend, Conditions, DataStore, DataStoreInfo, DataStoreMetadata,
+    DelegatedPuzzle, LineageProof, MerkleCoinSpend, Owner, Proof, SpendContext,
 };
 pub use update::update_root;
 
