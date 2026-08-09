@@ -16,12 +16,13 @@
 //! the creator spend to `did_ref_from_spend`, fail-closed to `Ok(None)` at every missing hop.
 //! dig-merkle itself opens no socket (INV-1) — the caller implements the chain read.
 
-use chia_wallet_sdk::driver::{Did, Puzzle};
+use chia_wallet_sdk::driver::{Did, Puzzle, SpendContext};
 use chia_wallet_sdk::prelude::Allocator;
-use clvm_traits::ToClvm;
+use chia_wallet_sdk::types::Condition;
+use clvm_traits::{FromClvm, ToClvm};
 use dig_chainsource_interface::ChainSource;
 
-use crate::types::{Bytes32, CoinSpend};
+use crate::types::{Bytes32, Coin, CoinSpend};
 use crate::{MerkleError, MerkleResult};
 
 /// A reference to a DID, identified by its immutable `launcher_id` (the DID's on-chain identity).
@@ -83,20 +84,33 @@ pub fn did_ref_from_spend(spend: &CoinSpend) -> MerkleResult<Option<DidRef>> {
     }
 }
 
-/// Recovers the DID that OWNS the store launched at `store_id`, walking one lineage hop up (SPEC §3.7).
+/// Recovers the DID that OWNS the store launched at `store_id`, walking its launcher lineage up
+/// (SPEC §3.7).
 ///
-/// A DID-owned store has its launcher coin created by spending a DID-authorized coin. This walks that
-/// lineage via the injected [`ChainSource`] (INV-1 — dig-merkle opens no socket; the caller supplies
-/// the chain read):
+/// A DID-owned store has its launcher coin created — directly or through one intermediate coin — by
+/// spending a DID-authorized coin. This walks that lineage via the injected [`ChainSource`] (INV-1 —
+/// dig-merkle opens no socket; the caller supplies the chain read):
 ///
 /// 1. `chain.coin_spend(store_id)` — the launcher coin's spend (`store_id == launcher_id`).
 /// 2. `launcher_spend.coin.parent_coin_info` — the coin that CREATED the launcher.
-/// 3. `chain.coin_spend(parent_id)` — that creator's spend.
-/// 4. [`did_ref_from_spend`] — `Some(DidRef)` if the creator was a DID, else `None`.
+/// 3. `chain.coin_spend(parent_id)` — that creator's spend. A DID here is the answer.
+/// 4. Otherwise, IF that creator is an intermediate-launcher coin (see below), ONE further hop to
+///    its own creator, which is where a singleton-parent launch puts the DID.
 ///
-/// It is **fail-closed to `Ok(None)`** at every missing/non-DID step — a store that is simply not
-/// DID-owned is `Ok(None)`, never an error — and READ-ONLY (never signs, spends, or broadcasts). A
-/// [`ChainSource`] read error surfaces as [`MerkleError::Chain`].
+/// # The walk is bounded at TWO creator hops, and the second is earned, not assumed
+///
+/// A singleton's inner puzzle may emit exactly one odd-amount `CREATE_COIN` — its own successor — so
+/// a DID cannot parent a 1-mojo launcher directly; it creates an even-amount intermediate coin that
+/// creates the launcher (SPEC §3.1a). The walk therefore tolerates exactly ONE such hop. It is not a
+/// general parent walk: an unbounded climb over coin records an untrusted source controls is a DoS,
+/// and it would also mis-attribute an ordinary store whose funding coin merely happened to come from
+/// a DID. The second hop is taken only when the creator is *structurally* an intermediate launcher —
+/// a zero-amount coin whose spend creates exactly one coin, and that coin IS this store's launcher.
+/// Anything else stops the walk at `Ok(None)`.
+///
+/// It is **fail-closed to `Ok(None)`** at every missing/non-DID/unexpected step — a store that is
+/// simply not DID-owned is `Ok(None)`, never an error — and READ-ONLY (never signs, spends, or
+/// broadcasts). A [`ChainSource`] read error surfaces as [`MerkleError::Chain`].
 ///
 /// # Authoritative ONLY for a CONFIRMED on-chain spend (NC-9)
 ///
@@ -132,23 +146,86 @@ pub fn resolve_owner_did<C: ChainSource>(
         )));
     }
 
-    let parent_id = launcher_spend.coin.parent_coin_info;
-    let Some(creator_spend) = read_coin_spend(chain, parent_id)? else {
+    let Some(creator_spend) = read_bound_spend(chain, launcher_spend.coin.parent_coin_info)? else {
+        return Ok(None);
+    };
+    if let Some(did_ref) = did_ref_from_spend(&creator_spend)? {
+        return Ok(Some(did_ref));
+    }
+
+    // The creator was not a DID. The ONE remaining shape a DID-rooted store can have is a singleton
+    // parent that interposed an intermediate launcher coin; take exactly one more hop, and only when
+    // this creator really is that intermediate.
+    if !is_launcher_intermediate(&creator_spend, launcher_spend.coin) {
+        return Ok(None);
+    }
+    let Some(singleton_spend) = read_bound_spend(chain, creator_spend.coin.parent_coin_info)?
+    else {
         return Ok(None);
     };
 
-    // Fail-closed identity binding (NC-9) for the second hop: the creator spend fetched under
-    // `parent_id` must actually BE the coin that created the launcher. As above, a source could return
-    // an unrelated DID spend under this id; without binding it to `parent_id` the walk would recognise
-    // a DID that never authorized this store.
-    if creator_spend.coin.coin_id() != parent_id {
+    did_ref_from_spend(&singleton_spend)
+}
+
+/// Reads the spend of `coin_id` and binds the answer to the id that was asked for.
+///
+/// Fail-closed identity binding (NC-9): the injected [`ChainSource`] is trusted to return CONFIRMED
+/// spends, never to return the RIGHT coin — a hostile or buggy source (the attacker-influenceable
+/// public gateway, §5.3) can answer any read with an unrelated but valid DID spend, and without this
+/// check the walk would recognise a DID that never authorized this store. A substituted answer is an
+/// `Err`, not `Ok(None)`, so it stays distinguishable from a genuinely non-DID-owned store.
+fn read_bound_spend<C: ChainSource>(
+    chain: &C,
+    coin_id: Bytes32,
+) -> MerkleResult<Option<CoinSpend>> {
+    let Some(spend) = read_coin_spend(chain, coin_id)? else {
+        return Ok(None);
+    };
+    if spend.coin.coin_id() != coin_id {
         return Err(MerkleError::Chain(format!(
-            "creator spend for {parent_id} is coin {}, not the launcher's parent",
-            creator_spend.coin.coin_id()
+            "spend for {coin_id} is coin {}, not the coin that was requested",
+            spend.coin.coin_id()
         )));
     }
+    Ok(Some(spend))
+}
 
-    did_ref_from_spend(&creator_spend)
+/// Whether `spend` is the intermediate-launcher coin that created `launcher_coin` — the single hop
+/// the owner walk is allowed to traverse (SPEC §3.1a/§3.7).
+///
+/// Recognised by SHAPE, not by puzzle hash, so it holds for any `mint_number`/`mint_total` the caller
+/// chose: a zero-amount coin (the even output a singleton parent is permitted to make alongside its
+/// successor) whose spend creates exactly one coin, and that coin IS this store's launcher. An
+/// ordinary funding coin that merely happens to descend from a DID fails the amount check, so the
+/// walk cannot climb through it and mis-attribute the store. Any parse or evaluation failure is
+/// `false` — fail closed.
+fn is_launcher_intermediate(spend: &CoinSpend, launcher_coin: Coin) -> bool {
+    if spend.coin.amount != 0 {
+        return false;
+    }
+    let Ok(created) = coins_created_by(spend) else {
+        return false;
+    };
+    created.len() == 1 && created[0].coin_id() == launcher_coin.coin_id()
+}
+
+/// Runs `spend`'s puzzle against its solution and returns the coins its `CREATE_COIN` conditions make.
+fn coins_created_by(spend: &CoinSpend) -> MerkleResult<Vec<Coin>> {
+    let mut ctx = SpendContext::new();
+    let puzzle = ctx.alloc(&spend.puzzle_reveal)?;
+    let solution = ctx.alloc(&spend.solution)?;
+    let output = ctx.run(puzzle, solution)?;
+    let conditions = Vec::<Condition>::from_clvm(&*ctx, output)
+        .map_err(|error| MerkleError::Parse(format!("creator spend conditions: {error}")))?;
+
+    let parent_id = spend.coin.coin_id();
+    Ok(conditions
+        .into_iter()
+        .filter_map(|condition| match condition {
+            Condition::CreateCoin(cc) => Some(Coin::new(parent_id, cc.puzzle_hash, cc.amount)),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Reads the spend that spent `coin_id`, mapping the source's own error into [`MerkleError::Chain`]

@@ -29,7 +29,7 @@ use crate::{MerkleError, MerkleResult};
 /// The well-known singleton launcher puzzle hash. A `CREATE_COIN` to this puzzle hash mints the
 /// store's launcher coin (whose `coin_id == launcher_id == store_id`); it is the memo carrier we
 /// override with the owner-discovery hint. Pinned as a literal so the crate self-contains it.
-pub(crate) const SINGLETON_LAUNCHER_HASH: Bytes32 = Bytes32::new(hex!(
+const SINGLETON_LAUNCHER_HASH: Bytes32 = Bytes32::new(hex!(
     "eff07522495060c066f66f32acc2a77e3a3e737aca8baea4d1a64ea4cdc13da9"
 ));
 
@@ -1082,6 +1082,148 @@ mod tests {
             launch.datastore.info,
             "both paths describe the same eve DataStore"
         );
+    }
+
+    /// Launches a store from `parent_singleton_coin_id` and returns the built coin spends, using
+    /// `launcher_for` to choose the launcher shape. The parent singleton is spent by `spend_parent`,
+    /// which folds the launch's `parent_conditions` into the singleton's own recreation.
+    ///
+    /// Both singleton-parent tests below differ ONLY in the launcher they build, so sharing the rest
+    /// makes the negative control a genuine control: nothing else varies.
+    fn launch_from_singleton(
+        ctx: &mut SpendContext,
+        launcher: Launcher,
+        owner_ph: Bytes32,
+        spend_parent: impl FnOnce(&mut SpendContext, Conditions) -> anyhow::Result<()>,
+    ) -> anyhow::Result<DatastoreLaunch> {
+        let launch = mint_datastore_launch_with_kind(
+            ctx,
+            StoreKind::DidProfile,
+            launcher,
+            Bytes32::new([0x6d; 32]),
+            Some("profile".into()),
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            vec![],
+        )?;
+        spend_parent(ctx, launch.parent_conditions.clone())?;
+        Ok(launch)
+    }
+
+    /// LOAD-BEARING (#2418): a store launched from a SINGLETON parent through an intermediate
+    /// launcher is ACCEPTED on chain, and the eve store hydrates from the launcher spend.
+    ///
+    /// This is the composition the composable launch API exists for. The parent here is a DID
+    /// singleton (built with the SDK — dig-merkle holds no `dig-did` dependency); the DID's spend
+    /// emits its own recreation PLUS the launch's conditions, which create the even-amount
+    /// intermediate coin rather than the launcher itself.
+    #[test]
+    fn a_singleton_parent_launch_via_an_intermediate_validates_on_chain() -> anyhow::Result<()> {
+        use chia_wallet_sdk::driver::{IntermediateLauncher, StandardLayer};
+
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let alice = sim.bls(1_000_000);
+        let alice_p2 = StandardLayer::new(alice.pk);
+        let owner_ph: Bytes32 = StandardArgs::curry_tree_hash(alice.pk).into();
+
+        let (create_did, did) =
+            Launcher::new(alice.coin.coin_id(), 1).create_simple_did(ctx, &alice_p2)?;
+        alice_p2.spend(ctx, alice.coin, create_did)?;
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+
+        let did_coin_id = did.coin.coin_id();
+        let intermediate = IntermediateLauncher::new(did_coin_id, 0, 1);
+        let intermediate_coin = intermediate.intermediate_coin();
+        let launcher = intermediate.create(ctx)?;
+        let launch = launch_from_singleton(ctx, launcher, owner_ph, |ctx, conditions| {
+            did.update(ctx, &alice_p2, conditions)?;
+            Ok(())
+        })?;
+
+        // The launcher is 1 mojo minted by a ZERO-amount intermediate, so the bundle needs a mojo
+        // from somewhere: a funding coin spent to nothing supplies it (Chia balances a bundle in
+        // aggregate, not per coin).
+        let funder = sim.bls(1);
+        StandardLayer::new(funder.pk).spend(ctx, funder.coin, Conditions::new())?;
+
+        let coin_spends = ctx.take();
+        sim.spend_coins(coin_spends.clone(), &[alice.sk.clone(), funder.sk.clone()])?;
+
+        // The launcher coin really was created and spent, and the eve store hydrates from it.
+        let store_id = launch.datastore.info.launcher_id;
+        let launcher_spend = coin_spends
+            .iter()
+            .find(|spend| spend.coin.coin_id() == store_id)
+            .expect("the launcher coin was spent");
+        let hydrated = DataStore::<DigDataStoreMetadata>::from_spend(
+            &mut SpendContext::new(),
+            launcher_spend,
+            &[],
+        )?
+        .expect("launcher spend hydrates a datastore");
+
+        assert_eq!(hydrated.info.metadata.root_hash, Bytes32::new([0x6d; 32]));
+        assert_eq!(hydrated.info.launcher_id, store_id);
+        assert_eq!(
+            launcher_spend.coin.parent_coin_info,
+            intermediate_coin.coin_id(),
+            "the launcher's parent is the intermediate coin, not the singleton itself"
+        );
+        assert_eq!(
+            intermediate_coin.amount, 0,
+            "the coin the singleton emits is EVEN — the reason this composition is legal"
+        );
+        assert_ne!(
+            launcher_spend.coin.parent_coin_info, did_coin_id,
+            "the intermediate coin sits between the singleton and the launcher"
+        );
+        Ok(())
+    }
+
+    /// The NEGATIVE CONTROL for the test above, and the reason the intermediate is not ceremony:
+    /// the SAME launch with the launcher parented DIRECTLY to the singleton is REJECTED by the
+    /// simulator. A Chia singleton's inner puzzle may emit exactly ONE odd-amount `CREATE_COIN` — its
+    /// own successor — so the 1-mojo launcher is a second odd output and the bundle raises.
+    ///
+    /// Everything except the launcher shape is identical to the accepted case, so a pass here can
+    /// only mean the direct shape was rejected for the odd-coin rule.
+    #[test]
+    fn a_launcher_parented_directly_to_a_singleton_is_rejected_on_chain() -> anyhow::Result<()> {
+        use chia_wallet_sdk::driver::StandardLayer;
+
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let alice = sim.bls(1_000_000);
+        let alice_p2 = StandardLayer::new(alice.pk);
+        let owner_ph: Bytes32 = StandardArgs::curry_tree_hash(alice.pk).into();
+
+        let (create_did, did) =
+            Launcher::new(alice.coin.coin_id(), 1).create_simple_did(ctx, &alice_p2)?;
+        alice_p2.spend(ctx, alice.coin, create_did)?;
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+
+        let did_coin_id = did.coin.coin_id();
+        let launcher = Launcher::new(did_coin_id, 1);
+        let _launch = launch_from_singleton(ctx, launcher, owner_ph, |ctx, conditions| {
+            did.update(ctx, &alice_p2, conditions)?;
+            Ok(())
+        })?;
+
+        let funder = sim.bls(1);
+        StandardLayer::new(funder.pk).spend(ctx, funder.coin, Conditions::new())?;
+
+        let result = sim.spend_coins(ctx.take(), &[alice.sk.clone(), funder.sk.clone()]);
+        eprintln!("REJECTION: {result:?}");
+        assert!(
+            result.is_err(),
+            "a 1-mojo launcher emitted directly by a singleton is a second odd CREATE_COIN and \
+             must be rejected on chain"
+        );
+        Ok(())
     }
 
     /// Regression (#1227): a `fee == u64::MAX` must fail closed with [`MerkleError::Chain`] rather
