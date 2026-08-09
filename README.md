@@ -77,7 +77,7 @@ designed surface; each lands in its own unit.
 | `mint::mint_datastore(parent_coin, owner, root_hash, label, description, size_proof, program_hash, size_bucket, owner_ph, delegated, fee)` | **shipped** — launch a new DataLayer store anchoring a root, byte-identical to on-chain stores | owner's `AGG_SIG_ME` |
 | `size::SizeBucket` (`from_exponent`/`for_byte_len`/`exponent`/`megabytes`/`byte_len`) | **shipped** — the canonical `.dig` size-bucket ladder (`k ∈ 0..=10` ↔ `2^k MB`, 1 MB..1 GB); CLVM key `sz`, replaces the exact-byte `"b"` | — |
 | `digstore_owner_hint(owner_ph)` / `DATASTORE_LAUNCHER_HINT` / `DIGSTORE_OWNER_HINT_DOMAIN` | **shipped** — the owner-discovery hint (SPEC §9) | — |
-| `read::did_ref_from_spend(&coin_spend)` | **shipped** — recognise a DID coin spend, returning its `DidRef { launcher_id }` (fail-closed to `None`) | none |
+| `read::did_ref_from_spend(&coin_spend)` | **shipped** — recognise a DID coin spend, returning its `DidRef { launcher_id }` (a non-DID puzzle is `None`; a reveal the coin did not commit to is `Err(Chain)`) | none |
 | `read::resolve_owner_did(store_id, &chain)` | recover the DID that owns a store via a `ChainSource` lineage walk (SPEC §3.7) — *pending `dig-chainsource-interface` crates.io publish* | none |
 | `update::update_root(store, owner, new_metadata)` | recreate the coin with a new merkle root | owner or writer/admin `AGG_SIG_ME` |
 | `delegation::set_delegated_puzzles(store, owner, set)` | grant/revoke admin/writer/oracle authority (admin-only) | owner or admin `AGG_SIG_ME` |
@@ -99,20 +99,60 @@ on-chain. It is the default behaviour, verified by a golden test.
 
 ### DID composition
 
-`mint_datastore` takes a **`parent_coin`**, not a full launcher, so a DID-authorized launcher
-produced by [`dig-did`](https://crates.io/crates/dig-did) composes here **without a `dig-did`
-dependency**: pass the DID coin as `parent_coin` with an `Owner::Custom` inner spend that satisfies
-the DID puzzle. The dependency edge is one-way (dig-identity → dig-merkle); dig-merkle depends on no
+A DIG store can be rooted in a DID **without a `dig-did` dependency**. The composable path is:
+
+1. Build the launcher for your parent's shape. A DID is a **singleton**, whose inner puzzle may emit
+   exactly ONE odd-amount `CREATE_COIN` — its own successor — so it cannot create the 1-mojo launcher
+   directly; the bundle would build cleanly and be rejected on chain. Interpose an intermediate coin:
+   `IntermediateLauncher::new(did.coin.coin_id(), 0, 1).create(&mut ctx)?`. (An ordinary, non-singleton
+   parent uses `Launcher::new(parent_coin.coin_id(), 1)`.) Both are re-exported here.
+2. Call `mint_datastore_launch_with_kind(&mut ctx, kind, launcher, ..)` — this stages the launcher and
+   eve-DataStore spends into `ctx` and returns a `DatastoreLaunch` whose `parent_conditions` carry the
+   `CREATE_COIN` that starts the launch (the intermediate coin, or the launcher itself for a direct
+   launch) plus the announcement assertions that the DID-authorized parent spend **must** emit.
+3. Build your DID-authorized parent-coin spend on the **same** `ctx`, folding in
+   `DatastoreLaunch::parent_conditions`.
+4. Drain `ctx` once to get the complete spend bundle.
+
+The launcher is created at 1 mojo by a **zero-amount** intermediate, so the bundle must carry that
+mojo from another spend; Chia balances a bundle in aggregate, not per coin.
+
+The two-memo owner-discovery hint lives on the launcher `CREATE_COIN`, which an intermediate launch
+emits from its own fixed puzzle — so a store launched this way carries **no launcher memos** and is
+not found by a launcher-memo scan. The `kind` discriminator rides on those same memos, so it too is
+accepted but not written on this path — the launch reports `launcher_memos_written == false` so a
+caller can see it. Such a store is discovered by `resolve_owner_did` instead (below).
+
+**The two shapes trade memo-scannability against lineage-resolvability, and a DID-rooted launch has
+to pick one.** The intermediate shape is resolvable by `resolve_owner_did` but writes no memos. The
+alternative — `DID coin -> ordinary EVEN-amount coin -> launcher -> store`, where the DID creates an
+ordinary even-amount coin and THAT coin launches directly — does write the memos, but is **not**
+resolvable: the launcher's creator is an ordinary coin, which is neither a DID nor the recognised
+intermediate launcher, so `resolve_owner_did` returns `None` for it today (known gap, **#2463**). The
+odd-coin restriction binds the *singleton's* inner puzzle, not an ordinary coin, so both compositions
+are legal on chain.
+
+Note also that the owner-discovery memo encodes the **owner puzzle hash**, not a DID — so a memo scan
+never yields a DID reference on either path; DID attribution comes only from the lineage walk.
+
+`mint_datastore_with_kind` (the all-in-one wrapper) accepts only `Owner::Standard` and rejects
+`Owner::Custom` with `MerkleError::UnsupportedOwner` — use the composable API above for DID-rooted
+stores. `update_root` and `melt` reject it for the same reason: each builds the conditions its spend
+must emit inside the call, and a pre-built inner spend cannot contain them. In practice `Owner::Custom`
+is unusable across the whole public API — a `Spend` holds CLVM node pointers valid only in the
+allocator that built them, and no public operation exposes its `SpendContext` for a caller to build one
+in. The dependency edge stays one-way (dig-identity → dig-merkle); dig-merkle depends on no
 `dig-*` crate except the canonical leaf `dig-chainsource-interface` (a reference-DOWN pure read
 interface BELOW dig-merkle, for §3.7 — pending its crates.io publish).
 
 ### Owner-DID discovery
 
-A store can be rooted in a DID (mint it with the DID coin as `parent_coin` + an `Owner::Custom`
-inner spend, above). To recover the owning DID back from chain, `resolve_owner_did` walks the store's
-launcher lineage one hop up and recognises a DID creator — delegating ALL chain reads to a
+A store launched **through an intermediate launcher** (the composable path above) can be traced back
+to its owning DID: `resolve_owner_did` walks the store's launcher lineage up — one creator hop, or two
+through that intermediate coin — and recognises a DID creator, delegating ALL chain reads to a
 caller-supplied `ChainSource` (the canonical `dig_chainsource_interface::ChainSource`), so dig-merkle
-stays network-free (INV-1):
+stays network-free (INV-1). A store launched directly from an ordinary coin resolves to `None`, even
+when a DID created that coin (#2463):
 
 ```rust,ignore
 use dig_merkle::{did_ref_from_spend, DidRef};

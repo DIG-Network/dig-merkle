@@ -16,9 +16,15 @@ use crate::MerkleResult;
 ///
 /// - [`Owner::Standard`] curries the standard single-key p2 layer over the owner key and emits the
 ///   supplied `conditions` from it (the usual path — one `AGG_SIG_ME` results).
-/// - [`Owner::Custom`] returns the caller's pre-built inner spend unchanged. A custom p2 puzzle
-///   bakes its own conditions in when the caller constructs it, so `conditions` is intentionally
-///   ignored for this variant — the caller owns the inner spend end to end.
+/// - [`Owner::Custom`] returns the caller's pre-built inner spend unchanged, so `conditions` is
+///   DROPPED for this variant. That is sound only where the caller could have known the conditions
+///   in advance and baked them into its own spend. It is NOT sound where an operation builds the
+///   conditions itself: a launch's parent conditions (the launcher `CREATE_COIN` and its
+///   announcement assertion) are produced inside `mint_datastore_with_kind`, so no pre-built spend
+///   can contain them — which is why the mint path REFUSES [`Owner::Custom`]
+///   ([`crate::MerkleError::UnsupportedOwner`]) and offers
+///   [`crate::mint_datastore_launch_with_kind`] instead. Any new caller of this helper must check
+///   the same question before accepting a custom owner.
 ///
 /// Consumed by every DataLayer operation module (mint, update, delegation, and beyond).
 pub(crate) fn inner_spend(

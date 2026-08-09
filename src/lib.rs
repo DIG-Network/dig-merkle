@@ -106,16 +106,23 @@ pub use hydrate::hydrate;
 pub use lineage::child_lineage_proof;
 pub use melt::melt;
 pub use metadata::DigDataStoreMetadata;
-pub use mint::{mint_datastore, mint_datastore_with_kind};
+pub use mint::{
+    mint_datastore, mint_datastore_launch_with_kind, mint_datastore_with_kind, DatastoreLaunch,
+};
 pub use read::{did_ref_from_spend, resolve_owner_did, DidRef};
 pub use sign::required_signatures;
 pub use size::SizeBucket;
 pub use types::{
-    Bytes32, Coin, CoinSpend, DataStore, DataStoreInfo, DataStoreMetadata, DelegatedPuzzle,
-    LineageProof, MerkleCoinSpend, Owner, Proof,
+    Bytes32, Coin, CoinSpend, Conditions, DataStore, DataStoreInfo, DataStoreMetadata,
+    DelegatedPuzzle, LineageProof, MerkleCoinSpend, Owner, Proof, SpendContext,
 };
 pub use update::update_root;
 
 // Re-export the signing types a consumer needs to CALL [`required_signatures`] and consume its
 // result, so a downstream crate need not add a direct chia-wallet-sdk dependency for them.
 pub use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature};
+
+// Re-export the two launcher builders a consumer needs to CALL
+// [`mint_datastore_launch_with_kind`], for the same reason: `Launcher::new(parent_coin_id, 1)` for an
+// ordinary parent, `IntermediateLauncher::new(parent_coin_id, 0, 1).create(ctx)?` for a singleton one.
+pub use chia_wallet_sdk::driver::{IntermediateLauncher, Launcher};

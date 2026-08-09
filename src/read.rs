@@ -1,25 +1,30 @@
 //! Reading on-chain DataLayer state without spending (SPEC §3.6/§3.7) — owner-DID discovery.
 //!
-//! A DIG store can be rooted in a DID: the store's launcher coin is created by spending a
-//! DID-authorized coin (an [`crate::Owner::Custom`] mint whose parent is the DID coin). This module
-//! recovers that owning DID by walking the store's launcher lineage one hop up to its creator and
-//! recognising a DID coin spend.
+//! A DIG store can be rooted in a DID: the store's launcher coin descends from a DID-authorized
+//! parent coin whose spend emits [`crate::DatastoreLaunch::parent_conditions`] (returned by
+//! [`crate::mint_datastore_launch_with_kind`]). A DID is a singleton, so it cannot parent the
+//! odd-amount launcher directly and interposes an even-amount intermediate coin (SPEC §3.1a). This
+//! module recovers the owning DID by walking the store's launcher lineage up — one hop, or two
+//! through that intermediate — and recognising a DID coin spend.
 //!
 //! ## Two layers
 //!
 //! [`did_ref_from_spend`] is the pure, network-free core — it recognises a DID from a single coin
-//! spend. [`resolve_owner_did`] is the launcher-lineage WALK on top: it fetches the two coin spends
-//! (`store_id` → its creator) through the injected CANONICAL
+//! spend. [`resolve_owner_did`] is the launcher-lineage WALK on top: it fetches the coin spends
+//! (`store_id` → its creator, and at most one hop beyond) through the injected CANONICAL
 //! [`dig_chainsource_interface::ChainSource`] read interface (a reference-DOWN pure leaf) and passes
-//! the creator spend to `did_ref_from_spend`, fail-closed to `Ok(None)` at every missing hop.
+//! the creator spend to `did_ref_from_spend`, fail-closed to `Ok(None)` at every missing hop — but
+//! to `Err(MerkleError::Chain)` when the source ANSWERS with something the coin did not commit to.
 //! dig-merkle itself opens no socket (INV-1) — the caller implements the chain read.
 
+use chia_puzzle_types::nft::NftIntermediateLauncherArgs;
 use chia_wallet_sdk::driver::{Did, Puzzle};
-use chia_wallet_sdk::prelude::Allocator;
-use clvm_traits::ToClvm;
+use chia_wallet_sdk::prelude::{Allocator, TreeHash};
+use chia_wallet_sdk::puzzles::{NFT_INTERMEDIATE_LAUNCHER_HASH, SINGLETON_LAUNCHER_HASH};
+use clvm_traits::{FromClvm, ToClvm};
 use dig_chainsource_interface::ChainSource;
 
-use crate::types::{Bytes32, CoinSpend};
+use crate::types::{Bytes32, Coin, CoinSpend};
 use crate::{MerkleError, MerkleResult};
 
 /// A reference to a DID, identified by its immutable `launcher_id` (the DID's on-chain identity).
@@ -33,8 +38,11 @@ pub struct DidRef {
     pub launcher_id: Bytes32,
 }
 
-/// Recognises whether a coin spend is a DID spend and, if so, returns its [`DidRef`]. Fail-closed:
-/// any spend that is not a parseable DID yields `Ok(None)` rather than an error.
+/// Recognises whether a coin spend is a DID spend and, if so, returns its [`DidRef`].
+///
+/// Fail-closed, and the two failures are DISTINCT: a genuine non-DID puzzle is `Ok(None)`, while a
+/// spend the coin did not commit to — a `puzzle_reveal` that does not hash to `coin.puzzle_hash` — is
+/// [`MerkleError::Chain`]. "Not a DID" is an answer; "the source lied about the puzzle" is not.
 ///
 /// This is the pure, network-free core of owner-DID discovery. Given the spend of a store launcher's
 /// PARENT coin, a `Some` result means that parent was a DID — i.e. the store is DID-owned — and names
@@ -56,9 +64,12 @@ pub struct DidRef {
 ///
 /// # Errors
 ///
-/// Returns [`MerkleError::Parse`] if the spend's puzzle/solution CLVM cannot be allocated, or
+/// Returns [`MerkleError::Parse`] if the spend's puzzle/solution CLVM cannot be allocated,
 /// [`MerkleError::Driver`] if the SDK's DID parser errors on a puzzle that structurally should have
-/// been a DID. A puzzle that simply is not a DID is `Ok(None)`, not an error.
+/// been a DID, and [`MerkleError::Chain`] if the `puzzle_reveal` does not hash to the spend's
+/// `coin.puzzle_hash` — a spend the coin never committed to, which is refused rather than parsed.
+///
+/// A puzzle that simply is not a DID is `Ok(None)`, not an error.
 pub fn did_ref_from_spend(spend: &CoinSpend) -> MerkleResult<Option<DidRef>> {
     let mut allocator = Allocator::new();
 
@@ -73,6 +84,18 @@ pub fn did_ref_from_spend(spend: &CoinSpend) -> MerkleResult<Option<DidRef>> {
 
     let puzzle = Puzzle::parse(&allocator, puzzle_ptr);
 
+    // The reveal must be the puzzle the coin COMMITS to. `Did::parse` never compares the two, and a
+    // coin id is computed from the coin's own fields, so a binding on the coin id alone lets a hostile
+    // chain source pair a genuine coin with a forged reveal and have a DID attributed to a store that
+    // has none. This is the same check `is_launcher_intermediate` makes on the intermediate hop.
+    if Bytes32::from(puzzle.curried_puzzle_hash()) != spend.coin.puzzle_hash {
+        return Err(MerkleError::Chain(format!(
+            "the puzzle reveal for coin {} does not hash to the coin's puzzle hash — the source \
+             returned a puzzle the coin never committed to",
+            spend.coin.coin_id()
+        )));
+    }
+
     match Did::parse(&allocator, spend.coin, puzzle, solution_ptr)? {
         Some((did, _p2_spend)) => Ok(Some(DidRef {
             launcher_id: did.info.launcher_id,
@@ -81,20 +104,45 @@ pub fn did_ref_from_spend(spend: &CoinSpend) -> MerkleResult<Option<DidRef>> {
     }
 }
 
-/// Recovers the DID that OWNS the store launched at `store_id`, walking one lineage hop up (SPEC §3.7).
+/// Recovers the DID that OWNS the store launched at `store_id`, walking its launcher lineage up
+/// (SPEC §3.7).
 ///
-/// A DID-owned store has its launcher coin created by spending a DID-authorized coin. This walks that
-/// lineage via the injected [`ChainSource`] (INV-1 — dig-merkle opens no socket; the caller supplies
-/// the chain read):
+/// A DID-owned store has its launcher coin created — directly or through one intermediate coin — by
+/// spending a DID-authorized coin. This walks that lineage via the injected [`ChainSource`] (INV-1 —
+/// dig-merkle opens no socket; the caller supplies the chain read):
 ///
 /// 1. `chain.coin_spend(store_id)` — the launcher coin's spend (`store_id == launcher_id`).
 /// 2. `launcher_spend.coin.parent_coin_info` — the coin that CREATED the launcher.
-/// 3. `chain.coin_spend(parent_id)` — that creator's spend.
-/// 4. [`did_ref_from_spend`] — `Some(DidRef)` if the creator was a DID, else `None`.
+/// 3. `chain.coin_spend(parent_id)` — that creator's spend. A DID here is the answer.
+/// 4. Otherwise, IF that creator is an intermediate-launcher coin (see below), ONE further hop to
+///    its own creator, which is where a singleton-parent launch puts the DID.
 ///
-/// It is **fail-closed to `Ok(None)`** at every missing/non-DID step — a store that is simply not
-/// DID-owned is `Ok(None)`, never an error — and READ-ONLY (never signs, spends, or broadcasts). A
-/// [`ChainSource`] read error surfaces as [`MerkleError::Chain`].
+/// # The walk is bounded at TWO creator hops, and the second is earned, not assumed
+///
+/// A singleton's inner puzzle may emit exactly one odd-amount `CREATE_COIN` — its own successor — so
+/// a DID cannot parent a 1-mojo launcher directly; it creates an even-amount intermediate coin that
+/// creates the launcher (SPEC §3.1a). The walk therefore tolerates exactly ONE such hop. It is not a
+/// general parent walk: an unbounded climb over coin records an untrusted source controls is a DoS,
+/// and it would also mis-attribute an ordinary store whose funding coin merely happened to come from
+/// a DID. The second hop is taken only when the creator IS the `nft_intermediate_launcher` puzzle,
+/// curried to the singleton launcher, and the launcher that puzzle necessarily creates is this
+/// store's. Anything else stops the walk at `Ok(None)`.
+///
+/// **The walk runs NO chain-supplied CLVM.** Every step parses or derives; none evaluates. An
+/// untrusted [`ChainSource`] therefore cannot spend the caller's CPU on a program of its choosing.
+///
+/// It is **fail-closed**, and READ-ONLY (never signs, spends, or broadcasts). Fail-closed splits two
+/// ways, and the split is the point:
+///
+/// - **`Ok(None)`** — the chain answered honestly and the answer is "no DID": a missing spend, a
+///   non-DID creator, or a creator the walk may not climb past. A store that is simply not DID-owned
+///   is never an error.
+/// - **[`MerkleError::Chain`]** — the source could not be consulted, or it ANSWERED with something the
+///   coin did not commit to: a read error, a spend whose `coin_id` is not the one requested, or a
+///   `puzzle_reveal` that does not hash to the coin's `puzzle_hash` (see [`did_ref_from_spend`]).
+///
+/// A hostile-source substitution is therefore distinguishable from a genuinely non-DID-owned store,
+/// rather than being flattened into the same `Ok(None)`.
 ///
 /// # Authoritative ONLY for a CONFIRMED on-chain spend (NC-9)
 ///
@@ -106,9 +154,12 @@ pub fn did_ref_from_spend(spend: &CoinSpend) -> MerkleResult<Option<DidRef>> {
 ///
 /// # Errors
 ///
-/// Returns [`MerkleError::Chain`] if a [`ChainSource`] read fails, or [`MerkleError::Parse`] /
-/// [`MerkleError::Driver`] if the creator spend fails to parse (propagated from
-/// [`did_ref_from_spend`]).
+/// Returns [`MerkleError::Chain`] if a [`ChainSource`] read fails, if a returned spend's `coin_id` is
+/// not the one requested, or if a returned `puzzle_reveal` does not hash to its coin's `puzzle_hash`;
+/// and [`MerkleError::Parse`] / [`MerkleError::Driver`] if the creator spend fails to parse (both
+/// propagated from [`did_ref_from_spend`]).
+///
+/// A store that is not DID-owned is `Ok(None)`, never an error.
 pub fn resolve_owner_did<C: ChainSource>(
     store_id: Bytes32,
     chain: &C,
@@ -130,23 +181,105 @@ pub fn resolve_owner_did<C: ChainSource>(
         )));
     }
 
-    let parent_id = launcher_spend.coin.parent_coin_info;
-    let Some(creator_spend) = read_coin_spend(chain, parent_id)? else {
+    let Some(creator_spend) = read_bound_spend(chain, launcher_spend.coin.parent_coin_info)? else {
+        return Ok(None);
+    };
+    if let Some(did_ref) = did_ref_from_spend(&creator_spend)? {
+        return Ok(Some(did_ref));
+    }
+
+    // The creator was not a DID. The ONE remaining shape a DID-rooted store can have is a singleton
+    // parent that interposed an intermediate launcher coin; take exactly one more hop, and only when
+    // this creator really is that intermediate.
+    if !is_launcher_intermediate(&creator_spend, launcher_spend.coin) {
+        return Ok(None);
+    }
+    let Some(singleton_spend) = read_bound_spend(chain, creator_spend.coin.parent_coin_info)?
+    else {
         return Ok(None);
     };
 
-    // Fail-closed identity binding (NC-9) for the second hop: the creator spend fetched under
-    // `parent_id` must actually BE the coin that created the launcher. As above, a source could return
-    // an unrelated DID spend under this id; without binding it to `parent_id` the walk would recognise
-    // a DID that never authorized this store.
-    if creator_spend.coin.coin_id() != parent_id {
+    did_ref_from_spend(&singleton_spend)
+}
+
+/// Reads the spend of `coin_id` and binds the answer to the id that was asked for.
+///
+/// Fail-closed identity binding (NC-9): the injected [`ChainSource`] is trusted to return CONFIRMED
+/// spends, never to return the RIGHT coin — a hostile or buggy source (the attacker-influenceable
+/// public gateway, §5.3) can answer any read with an unrelated but valid DID spend, and without this
+/// check the walk would recognise a DID that never authorized this store. A substituted answer is an
+/// `Err`, not `Ok(None)`, so it stays distinguishable from a genuinely non-DID-owned store.
+fn read_bound_spend<C: ChainSource>(
+    chain: &C,
+    coin_id: Bytes32,
+) -> MerkleResult<Option<CoinSpend>> {
+    let Some(spend) = read_coin_spend(chain, coin_id)? else {
+        return Ok(None);
+    };
+    if spend.coin.coin_id() != coin_id {
         return Err(MerkleError::Chain(format!(
-            "creator spend for {parent_id} is coin {}, not the launcher's parent",
-            creator_spend.coin.coin_id()
+            "spend for {coin_id} is coin {}, not the coin that was requested",
+            spend.coin.coin_id()
         )));
     }
+    Ok(Some(spend))
+}
 
-    did_ref_from_spend(&creator_spend)
+/// Whether `spend` is the intermediate-launcher coin that created `launcher_coin` — the single hop
+/// the owner walk is allowed to traverse (SPEC §3.1a/§3.7).
+///
+/// Recognised by the coin's actual PUZZLE: the uncurried `nft_intermediate_launcher` mod hash, with
+/// its curried `launcher_puzzle_hash` argument bound to the singleton launcher. Because that puzzle
+/// is fixed, its one `CREATE_COIN` is fully determined by the coin it is spending — so the launcher
+/// it produces is DERIVED here rather than observed, and matched by full coin id.
+///
+/// Two reasons this is not recognised by shape instead:
+///
+/// - **It would run chain-supplied CLVM.** The spend comes from an untrusted [`ChainSource`], and
+///   evaluating it means executing an attacker's program: 28 bytes of non-terminating puzzle burns
+///   seconds of CPU at the block cost limit, and the walk still returns `Ok(None)`, so a caller sees
+///   only latency and never an error. Uncurrying parses; it does not execute.
+/// - **Shape is a looser bind than the puzzle.** "A 0-amount coin whose spend creates exactly this
+///   launcher" admits ANY puzzle that happens to emit that one condition, not just the intermediate
+///   launcher the walk means to traverse.
+///
+/// The `mint_number`/`mint_total` the caller chose are deliberately not constrained — they vary the
+/// curried puzzle hash but not the behaviour. Any parse failure is `false` — fail closed.
+fn is_launcher_intermediate(spend: &CoinSpend, launcher_coin: Coin) -> bool {
+    if spend.coin.amount != 0 {
+        return false;
+    }
+
+    let mut allocator = Allocator::new();
+    let Ok(puzzle_ptr) = spend.puzzle_reveal.to_clvm(&mut allocator) else {
+        return false;
+    };
+    let puzzle = Puzzle::parse(&allocator, puzzle_ptr);
+
+    // The reveal must be the coin it claims to be; a chain source that returns a different puzzle
+    // than the coin commits to cannot steer the walk.
+    if Bytes32::from(puzzle.curried_puzzle_hash()) != spend.coin.puzzle_hash {
+        return false;
+    }
+
+    let Some(curried) = puzzle.as_curried() else {
+        return false;
+    };
+    if curried.mod_hash != TreeHash::new(NFT_INTERMEDIATE_LAUNCHER_HASH) {
+        return false;
+    }
+
+    let Ok(args) = NftIntermediateLauncherArgs::from_clvm(&allocator, curried.args) else {
+        return false;
+    };
+    if args.launcher_puzzle_hash != Bytes32::from(SINGLETON_LAUNCHER_HASH) {
+        return false;
+    }
+
+    // The intermediate puzzle's only output is a 1-mojo coin at the curried launcher puzzle hash,
+    // parented by the coin being spent — so the launcher is derivable without running anything.
+    Coin::new(spend.coin.coin_id(), args.launcher_puzzle_hash, 1).coin_id()
+        == launcher_coin.coin_id()
 }
 
 /// Reads the spend that spent `coin_id`, mapping the source's own error into [`MerkleError::Chain`]
@@ -285,6 +418,203 @@ mod tests {
         assert_eq!(
             did_ref.launcher_id, did_launcher_id,
             "resolve names the owning DID's launcher id"
+        );
+        Ok(())
+    }
+
+    /// LOAD-BEARING (#2418): a store launched from a DID SINGLETON — which must interpose an
+    /// intermediate launcher coin to stay legal on chain — still resolves to its owning DID.
+    ///
+    /// Every spend here is real and was accepted by the simulator, so the walk is exercised against
+    /// the exact bytes the launch composition produces, not a synthetic stand-in. Without the second
+    /// hop this returns `Ok(None)` — a DID-rooted store reporting as not DID-owned.
+    #[test]
+    fn resolve_owner_did_traverses_the_intermediate_launcher_hop() -> anyhow::Result<()> {
+        use chia_wallet_sdk::driver::IntermediateLauncher;
+
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let alice = sim.bls(1_000_000);
+        let alice_p2 = StandardLayer::new(alice.pk);
+
+        let (create_did, did) =
+            Launcher::new(alice.coin.coin_id(), 1).create_simple_did(ctx, &alice_p2)?;
+        alice_p2.spend(ctx, alice.coin, create_did)?;
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+
+        let did_coin_id = did.coin.coin_id();
+        let did_launcher_id = did.info.launcher_id;
+        let launcher = IntermediateLauncher::new(did_coin_id, 0, 1).create(ctx)?;
+        let launch = crate::mint_datastore_launch_with_kind(
+            ctx,
+            crate::StoreKind::DidProfile,
+            launcher,
+            Bytes32::new([0x6d; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            alice.puzzle_hash,
+            vec![],
+        )?;
+        let _child = did.update(ctx, &alice_p2, launch.parent_conditions.clone())?;
+
+        // The intermediate coin is created at 0 mojos, so the launcher's mojo comes from elsewhere.
+        let funder = sim.bls(1);
+        StandardLayer::new(funder.pk).spend(ctx, funder.coin, Conditions::new())?;
+
+        let coin_spends = ctx.take();
+        sim.spend_coins(coin_spends.clone(), &[alice.sk.clone(), funder.sk.clone()])?;
+
+        // Serve the REAL, on-chain-accepted spends back through the chain source.
+        let store_id = launch.datastore.info.launcher_id;
+        let chain = coin_spends
+            .iter()
+            .fold(MockChainSource::new(), |chain, spend| {
+                chain.with_spend(spend.coin.coin_id(), spend.clone())
+            });
+
+        let did_ref = resolve_owner_did(store_id, &chain)?
+            .expect("a singleton-rooted store resolves through the intermediate hop");
+        assert_eq!(
+            did_ref.launcher_id, did_launcher_id,
+            "the walk names the DID that authorized the launch"
+        );
+        Ok(())
+    }
+
+    /// The walk STOPS after the intermediate hop: a DID sitting one creator further up is NOT
+    /// reported. Chain: launcher ← a real intermediate ← an ordinary coin ← the DID.
+    ///
+    /// An unbounded parent walk returns `Some(did)` here, so this observes the bound rather than
+    /// restating it — and the bound is what keeps an untrusted source from driving an unbounded climb,
+    /// and keeps a store whose funding coin merely descends from a DID out of that DID's name.
+    #[test]
+    fn resolve_owner_did_does_not_walk_past_the_intermediate_hop() -> anyhow::Result<()> {
+        use chia_wallet_sdk::driver::IntermediateLauncher;
+
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let (did_spend, _did_launcher_id) = did_coin_and_spend(&mut sim)?;
+        let did_coin_id = did_spend.coin.coin_id();
+
+        // An ordinary coin whose PARENT is the DID coin — the extra hop the walk must not take.
+        let alice = sim.bls(1);
+        let alice_p2 = StandardLayer::new(alice.pk);
+        let memos = ctx.hint(alice.puzzle_hash)?;
+        alice_p2.spend(
+            ctx,
+            alice.coin,
+            Conditions::new().create_coin(alice.puzzle_hash, 1, memos),
+        )?;
+        let template = ctx
+            .take()
+            .into_iter()
+            .find(|spend| spend.coin.coin_id() == alice.coin.coin_id())
+            .expect("standard spend present");
+        let ordinary_coin = Coin::new(did_coin_id, alice.puzzle_hash, alice.coin.amount);
+        let ordinary_spend = CoinSpend::new(
+            ordinary_coin,
+            template.puzzle_reveal.clone(),
+            template.solution.clone(),
+        );
+
+        // A real intermediate launcher parented to that ordinary coin.
+        let intermediate = IntermediateLauncher::new(ordinary_coin.coin_id(), 0, 1);
+        let launcher_coin = intermediate.launcher_coin();
+        let _launcher = intermediate.create(ctx)?;
+        let intermediate_spend = ctx
+            .take()
+            .into_iter()
+            .next()
+            .expect("the intermediate coin spend is staged");
+        let launcher_spend = CoinSpend::new(
+            launcher_coin,
+            template.puzzle_reveal.clone(),
+            template.solution.clone(),
+        );
+
+        let store_id = launcher_coin.coin_id();
+        let chain = MockChainSource::new()
+            .with_spend(store_id, launcher_spend)
+            .with_spend(intermediate_spend.coin.coin_id(), intermediate_spend)
+            .with_spend(ordinary_coin.coin_id(), ordinary_spend)
+            .with_spend(did_coin_id, did_spend);
+
+        assert_eq!(
+            resolve_owner_did(store_id, &chain)?,
+            None,
+            "a DID two creators above the launcher is out of the walk's bound"
+        );
+        Ok(())
+    }
+
+    /// LOAD-BEARING: a hostile [`ChainSource`] cannot make the walk EXECUTE a program of its
+    /// choosing.
+    ///
+    /// The fixture is a 7-byte non-terminating puzzle — `(a 1 1)`, which applies its own solution to
+    /// itself forever — presented as the launcher's creator at amount 0, with the coin's puzzle hash
+    /// set to that puzzle's real tree hash so the spend is internally consistent. It therefore
+    /// satisfies every precondition the old shape-based recogniser checked before running the spend,
+    /// which is what makes it discriminating: the previous implementation evaluated it at the full
+    /// mainnet block cost limit (measured: ~7.1s of single-thread CPU in a release build, far worse
+    /// unoptimised) and still answered `Ok(None)`, so a caller saw only unexplained latency.
+    ///
+    /// The elapsed-time bound is the assertion, because the property IS about CPU. The margin is
+    /// enormous by construction — recognising the puzzle without running it is microseconds, and the
+    /// old path could not finish in seconds — so this cannot flake on a slow machine.
+    #[test]
+    fn the_walk_never_runs_a_chain_supplied_puzzle() -> anyhow::Result<()> {
+        use chia_wallet_sdk::clvm_utils::tree_hash;
+        use std::time::Instant;
+
+        // `(a 1 1)`: apply the environment as a program, in that same environment — non-terminating.
+        let hostile_bytes = hex_literal::hex!("ff02ff01ff0180").to_vec();
+        let hostile = crate::types::CoinSpend::new(
+            Coin::new(Bytes32::new([0x9e; 32]), Bytes32::new([0; 32]), 0),
+            hostile_bytes.clone().into(),
+            hostile_bytes.into(),
+        );
+
+        // Bind the coin to the puzzle it reveals, so the fixture passes every check that precedes
+        // the point at which the old implementation would have started executing.
+        let mut allocator = Allocator::new();
+        let puzzle_ptr = hostile.puzzle_reveal.to_clvm(&mut allocator)?;
+        let hostile = crate::types::CoinSpend::new(
+            Coin::new(
+                hostile.coin.parent_coin_info,
+                tree_hash(&allocator, puzzle_ptr).into(),
+                0,
+            ),
+            hostile.puzzle_reveal,
+            hostile.solution,
+        );
+
+        let launcher_coin = Coin::new(
+            hostile.coin.coin_id(),
+            Bytes32::from(SINGLETON_LAUNCHER_HASH),
+            1,
+        );
+        let store_id = launcher_coin.coin_id();
+        let launcher_spend = CoinSpend::new(
+            launcher_coin,
+            hostile.puzzle_reveal.clone(),
+            hostile.solution.clone(),
+        );
+        let chain = MockChainSource::new()
+            .with_spend(store_id, launcher_spend)
+            .with_spend(hostile.coin.coin_id(), hostile);
+
+        let started = Instant::now();
+        let resolved = resolve_owner_did(store_id, &chain)?;
+        let elapsed = started.elapsed();
+
+        assert_eq!(resolved, None, "a hostile creator is not a DID owner");
+        assert!(
+            elapsed.as_secs() < 2,
+            "the walk must recognise the hop without executing chain-supplied CLVM, but took \
+             {elapsed:?}"
         );
         Ok(())
     }
@@ -437,6 +767,200 @@ mod tests {
                 Err(MerkleError::Chain(_))
             ),
             "a creator spend not bound to the launcher's parent is rejected"
+        );
+        Ok(())
+    }
+
+    /// PINS A KNOWN GAP, tracked as **#2463** — this is NOT desired behaviour.
+    ///
+    /// The memo-scannable profile chain (`DID coin -> ordinary EVEN-amount coin -> launcher (memos
+    /// intact) -> store`, SPEC §3.1a) is NOT lineage-resolvable: the launcher's creator is an
+    /// ordinary coin, which is neither a DID nor the recognised intermediate launcher, so the walk
+    /// stops at `Ok(None)` and a DID-rooted profile store reports as not-DID-owned.
+    ///
+    /// Extending the walk over that hop is refused deliberately: an ordinary coin's outputs are
+    /// knowable only by EXECUTING its puzzle — the chain-supplied CLVM the walk exists to never run
+    /// (see [`is_launcher_intermediate`]) — and accepting the parent claim unexamined would let any
+    /// store whose launcher's parent happened to be DID-created falsely claim DID ownership.
+    ///
+    /// Every spend here is real and was accepted by the simulator, so this pins what the composition
+    /// the SPEC recommends actually resolves to today, and will fail the moment #2463 changes it.
+    #[test]
+    fn the_memo_scannable_profile_chain_does_not_resolve_its_did() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let alice = sim.bls(1_000_000);
+        let alice_p2 = StandardLayer::new(alice.pk);
+
+        // Every block's spends are kept, because the chain source must serve the WHOLE lineage —
+        // the walk stopping early must be the resolver's doing, not a source that forgot the DID.
+        let mut settled: Vec<CoinSpend> = Vec::new();
+
+        // Block 1 — the DID exists.
+        let (create_did, did) =
+            Launcher::new(alice.coin.coin_id(), 1).create_simple_did(ctx, &alice_p2)?;
+        alice_p2.spend(ctx, alice.coin, create_did)?;
+        let block = ctx.take();
+        sim.spend_coins(block.clone(), std::slice::from_ref(&alice.sk))?;
+        settled.extend(block);
+
+        // Block 2 — the DID creates an ORDINARY, EVEN-amount coin. Even keeps the singleton's
+        // one-odd-`CREATE_COIN` rule satisfied, which is what makes this composition legal.
+        let did_coin_id = did.coin.coin_id();
+        let ordinary = Coin::new(did_coin_id, alice.puzzle_hash, 2);
+        let hint = ctx.hint(alice.puzzle_hash)?;
+        let _child = did.update(
+            ctx,
+            &alice_p2,
+            Conditions::new().create_coin(alice.puzzle_hash, 2, hint),
+        )?;
+        // The DID recreates itself AND emits the 2-mojo coin, so the bundle needs those 2 mojos from
+        // elsewhere; Chia balances a bundle in aggregate, not per coin.
+        let funder = sim.bls(2);
+        StandardLayer::new(funder.pk).spend(ctx, funder.coin, Conditions::new())?;
+        let block = ctx.take();
+        sim.spend_coins(block.clone(), &[alice.sk.clone(), funder.sk.clone()])?;
+        settled.extend(block);
+
+        // Block 3 — the ordinary coin launches the store DIRECTLY, so the memos ARE written.
+        let launch = crate::mint_datastore_launch_with_kind(
+            ctx,
+            crate::StoreKind::DidProfile,
+            Launcher::new(ordinary.coin_id(), 1),
+            Bytes32::new([0x6d; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            alice.puzzle_hash,
+            vec![],
+        )?;
+        assert!(
+            launch.launcher_memos_written,
+            "the direct shape is the one that IS memo-scannable (test precondition)"
+        );
+        alice_p2.spend(ctx, ordinary, launch.parent_conditions.clone())?;
+        let block = ctx.take();
+        sim.spend_coins(block.clone(), std::slice::from_ref(&alice.sk))?;
+        settled.extend(block);
+
+        let store_id = launch.datastore.info.launcher_id;
+        let chain = settled.iter().fold(MockChainSource::new(), |chain, spend| {
+            chain.with_spend(spend.coin.coin_id(), spend.clone())
+        });
+
+        // The `None` must be caused by the ORDINARY hop, not by a fixture that lost its DID: the
+        // launcher's creator really is the ordinary coin, that coin's creator really is the DID coin,
+        // and the source really can serve every spend in between. Without these the assertion below
+        // would also pass on a chain that simply had no DID in it.
+        let launcher_spend = chain
+            .coin_spend(store_id)?
+            .expect("the source serves the launcher spend");
+        assert_eq!(
+            launcher_spend.coin.parent_coin_info,
+            ordinary.coin_id(),
+            "the launcher's creator is the ordinary even-amount coin"
+        );
+        let ordinary_spend = chain
+            .coin_spend(ordinary.coin_id())?
+            .expect("the source serves the ordinary coin's spend");
+        assert_eq!(
+            ordinary_spend.coin.parent_coin_info, did_coin_id,
+            "and that coin's own creator is the DID — the DID sits exactly two hops up"
+        );
+        assert!(
+            crate::did_ref_from_spend(&ordinary_spend)?.is_none()
+                && !super::is_launcher_intermediate(&ordinary_spend, launcher_spend.coin),
+            "the creator is neither a DID nor the recognised intermediate launcher — the only two \
+             shapes the walk can traverse, which is exactly why it stops"
+        );
+        assert!(
+            crate::did_ref_from_spend(
+                &chain
+                    .coin_spend(did_coin_id)?
+                    .expect("the source serves the DID spend")
+            )?
+            .is_some(),
+            "the DID spend IS present and IS recognisable, so only the ordinary hop stops the walk"
+        );
+
+        assert_eq!(
+            resolve_owner_did(store_id, &chain)?,
+            None,
+            "KNOWN GAP #2463: the memo-scannable profile chain resolves to None, because the \
+             launcher's creator is an ordinary coin the walk cannot traverse without running \
+             chain-supplied CLVM"
+        );
+        Ok(())
+    }
+
+    /// A hostile [`ChainSource`] cannot attribute a DID to a store that has none by pairing a GENUINE
+    /// coin with a FORGED puzzle reveal.
+    ///
+    /// The coin-id binding cannot catch this: a coin id is computed from the coin's own fields, so it
+    /// is satisfied by any reveal whatsoever, and `Did::parse` never compares the reveal to
+    /// `coin.puzzle_hash`. Here the creator coin is an ordinary standard-p2 coin with no DID link at
+    /// all, served with a real DID's puzzle reveal — and the walk must refuse rather than name a DID.
+    ///
+    /// The control is the same walk over the same store with the coin's OWN reveal, which correctly
+    /// resolves to `None`: so this observes the reveal binding, not a fixture that could not resolve
+    /// anything.
+    #[test]
+    fn a_forged_puzzle_reveal_cannot_attribute_a_did() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let (did_spend, _did_launcher_id) = did_coin_and_spend(&mut sim)?;
+
+        // An ordinary standard-p2 coin, spent honestly — it is nobody's DID.
+        let ctx = &mut SpendContext::new();
+        let alice = sim.bls(1);
+        let alice_p2 = StandardLayer::new(alice.pk);
+        alice_p2.spend(ctx, alice.coin, Conditions::new())?;
+        let honest_creator = ctx
+            .take()
+            .into_iter()
+            .find(|spend| spend.coin.coin_id() == alice.coin.coin_id())
+            .expect("the ordinary coin's spend is present");
+
+        let launcher_coin = Coin::new(alice.coin.coin_id(), Bytes32::new([0xb2; 32]), 1);
+        let store_id = launcher_coin.coin_id();
+        let launcher_spend = CoinSpend::new(
+            launcher_coin,
+            honest_creator.puzzle_reveal.clone(),
+            honest_creator.solution.clone(),
+        );
+
+        // Control: served honestly, the store is simply not DID-owned.
+        let honest = MockChainSource::new()
+            .with_spend(store_id, launcher_spend.clone())
+            .with_spend(alice.coin.coin_id(), honest_creator.clone());
+        assert_eq!(
+            resolve_owner_did(store_id, &honest)?,
+            None,
+            "the ordinary creator is not a DID (control)"
+        );
+
+        // The attack: the same genuine coin, served with a real DID's puzzle reveal.
+        let forged = CoinSpend::new(
+            honest_creator.coin,
+            did_spend.puzzle_reveal.clone(),
+            did_spend.solution.clone(),
+        );
+        assert_eq!(
+            forged.coin.coin_id(),
+            alice.coin.coin_id(),
+            "the coin-id binding is satisfied — only the reveal is forged"
+        );
+        let hostile = MockChainSource::new()
+            .with_spend(store_id, launcher_spend)
+            .with_spend(alice.coin.coin_id(), forged);
+
+        assert!(
+            matches!(
+                resolve_owner_did(store_id, &hostile),
+                Err(MerkleError::Chain(_))
+            ),
+            "a reveal the coin never committed to must be refused, never resolved to a DID"
         );
         Ok(())
     }
