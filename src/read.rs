@@ -368,6 +368,134 @@ mod tests {
         Ok(())
     }
 
+    /// LOAD-BEARING (#2418): a store launched from a DID SINGLETON — which must interpose an
+    /// intermediate launcher coin to stay legal on chain — still resolves to its owning DID.
+    ///
+    /// Every spend here is real and was accepted by the simulator, so the walk is exercised against
+    /// the exact bytes the launch composition produces, not a synthetic stand-in. Without the second
+    /// hop this returns `Ok(None)` — a DID-rooted store reporting as not DID-owned.
+    #[test]
+    fn resolve_owner_did_traverses_the_intermediate_launcher_hop() -> anyhow::Result<()> {
+        use chia_wallet_sdk::driver::IntermediateLauncher;
+
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let alice = sim.bls(1_000_000);
+        let alice_p2 = StandardLayer::new(alice.pk);
+
+        let (create_did, did) =
+            Launcher::new(alice.coin.coin_id(), 1).create_simple_did(ctx, &alice_p2)?;
+        alice_p2.spend(ctx, alice.coin, create_did)?;
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+
+        let did_coin_id = did.coin.coin_id();
+        let did_launcher_id = did.info.launcher_id;
+        let launcher = IntermediateLauncher::new(did_coin_id, 0, 1).create(ctx)?;
+        let launch = crate::mint_datastore_launch_with_kind(
+            ctx,
+            crate::StoreKind::DidProfile,
+            launcher,
+            Bytes32::new([0x6d; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            alice.puzzle_hash,
+            vec![],
+        )?;
+        did.update(ctx, &alice_p2, launch.parent_conditions.clone())?;
+
+        // The intermediate coin is created at 0 mojos, so the launcher's mojo comes from elsewhere.
+        let funder = sim.bls(1);
+        StandardLayer::new(funder.pk).spend(ctx, funder.coin, Conditions::new())?;
+
+        let coin_spends = ctx.take();
+        sim.spend_coins(coin_spends.clone(), &[alice.sk.clone(), funder.sk.clone()])?;
+
+        // Serve the REAL, on-chain-accepted spends back through the chain source.
+        let store_id = launch.datastore.info.launcher_id;
+        let chain = coin_spends
+            .iter()
+            .fold(MockChainSource::new(), |chain, spend| {
+                chain.with_spend(spend.coin.coin_id(), spend.clone())
+            });
+
+        let did_ref = resolve_owner_did(store_id, &chain)?
+            .expect("a singleton-rooted store resolves through the intermediate hop");
+        assert_eq!(
+            did_ref.launcher_id, did_launcher_id,
+            "the walk names the DID that authorized the launch"
+        );
+        Ok(())
+    }
+
+    /// The walk STOPS after the intermediate hop: a DID sitting one creator further up is NOT
+    /// reported. Chain: launcher ← a real intermediate ← an ordinary coin ← the DID.
+    ///
+    /// An unbounded parent walk returns `Some(did)` here, so this observes the bound rather than
+    /// restating it — and the bound is what keeps an untrusted source from driving an unbounded climb,
+    /// and keeps a store whose funding coin merely descends from a DID out of that DID's name.
+    #[test]
+    fn resolve_owner_did_does_not_walk_past_the_intermediate_hop() -> anyhow::Result<()> {
+        use chia_wallet_sdk::driver::IntermediateLauncher;
+
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let (did_spend, _did_launcher_id) = did_coin_and_spend(&mut sim)?;
+        let did_coin_id = did_spend.coin.coin_id();
+
+        // An ordinary coin whose PARENT is the DID coin — the extra hop the walk must not take.
+        let alice = sim.bls(1);
+        let alice_p2 = StandardLayer::new(alice.pk);
+        let memos = ctx.hint(alice.puzzle_hash)?;
+        alice_p2.spend(
+            ctx,
+            alice.coin,
+            Conditions::new().create_coin(alice.puzzle_hash, 1, memos),
+        )?;
+        let template = ctx
+            .take()
+            .into_iter()
+            .find(|spend| spend.coin.coin_id() == alice.coin.coin_id())
+            .expect("standard spend present");
+        let ordinary_coin = Coin::new(did_coin_id, alice.puzzle_hash, alice.coin.amount);
+        let ordinary_spend = CoinSpend::new(
+            ordinary_coin,
+            template.puzzle_reveal.clone(),
+            template.solution.clone(),
+        );
+
+        // A real intermediate launcher parented to that ordinary coin.
+        let intermediate = IntermediateLauncher::new(ordinary_coin.coin_id(), 0, 1);
+        let launcher_coin = intermediate.launcher_coin();
+        intermediate.create(ctx)?;
+        let intermediate_spend = ctx
+            .take()
+            .into_iter()
+            .next()
+            .expect("the intermediate coin spend is staged");
+        let launcher_spend = CoinSpend::new(
+            launcher_coin,
+            template.puzzle_reveal.clone(),
+            template.solution.clone(),
+        );
+
+        let store_id = launcher_coin.coin_id();
+        let chain = MockChainSource::new()
+            .with_spend(store_id, launcher_spend)
+            .with_spend(intermediate_spend.coin.coin_id(), intermediate_spend)
+            .with_spend(ordinary_coin.coin_id(), ordinary_spend)
+            .with_spend(did_coin_id, did_spend);
+
+        assert_eq!(
+            resolve_owner_did(store_id, &chain)?,
+            None,
+            "a DID two creators above the launcher is out of the walk's bound"
+        );
+        Ok(())
+    }
+
     /// A plain (non-DID) store resolves to `None`: the launcher's creator is an ordinary coin, not a
     /// DID — fail-closed, never an error (SPEC §3.7).
     #[test]
