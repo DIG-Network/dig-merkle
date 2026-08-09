@@ -271,18 +271,17 @@ pub struct DatastoreLaunch {
 ///   chain. `IntermediateLauncher` creates its intermediate coin at amount 0 (even); only that coin
 ///   creates the odd launcher.
 ///
-/// The launcher coin itself is checked for LEGALITY — the singleton launcher puzzle hash, and an ODD
-/// amount — and its `CREATE_COIN` chain is then checked for REACHABILITY. The two are independent:
-/// reachability alone is satisfied by construction for any caller-supplied launcher, because the
-/// conditions are built from that same coin's fields.
+/// The launcher is checked for LEGALITY — the singleton launcher puzzle hash, and an ODD
+/// `singleton_amount` — and its `CREATE_COIN` chain is then checked for REACHABILITY. The two are
+/// independent: reachability alone is satisfied by construction for any caller-supplied launcher,
+/// because the conditions are built from that same coin's fields.
 ///
-/// The odd-amount check exists because `Launcher::new(parent, 0)` is the plausible transposition of
-/// `IntermediateLauncher::new(parent, 0, 1)` — whose second argument is a `mint_number`, NOT an
-/// amount — and the two constructors are recommended two lines apart above. An even-amount launcher
-/// builds cleanly AND is accepted on chain, and only then is the store discovered to be permanently
-/// frozen: the singleton odd-amount rule makes every later `update_root` raise, so the store can
-/// never be updated or melted and the mojos are burned. Refusing it here is the only point at which
-/// that is still reversible.
+/// The odd-amount check is on the SINGLETON's amount, which is what the store is minted at — NOT the
+/// launcher coin's, which is not an invariant (a 0-amount launcher minting a 1-mojo singleton is a
+/// legal SDK composition). An even-amount store builds cleanly AND is accepted on chain, and only
+/// then is it discovered to be permanently frozen: the singleton odd-amount rule makes every later
+/// `update_root` and `melt` raise, so it can never be spent again and the mojos are burned. Refusing
+/// it here is the only point at which that is still reversible.
 ///
 /// # The owner-discovery memos need a DIRECT launcher (SPEC §3.7), and `kind` rides on them
 ///
@@ -324,10 +323,10 @@ pub fn mint_datastore_launch_with_kind(
     owner_puzzle_hash: Bytes32,
     delegated_puzzles: Vec<DelegatedPuzzle>,
 ) -> MerkleResult<DatastoreLaunch> {
-    // The launcher coin is fixed the moment the caller builds the `Launcher`; capture it before the
-    // builder consumes it, so the chain guard below can verify the conditions actually reach it.
+    // The launcher coin and the singleton amount are both fixed the moment the caller builds the
+    // `Launcher`; capture them before the builder consumes it, so the guards below can read them.
     let launcher_coin = launcher.coin();
-    assert_launcher_coin_is_legal(launcher_coin)?;
+    assert_launcher_is_legal(launcher_coin, launcher.singleton_amount())?;
 
     // Build the launcher + eve DataStore via the SDK (the byte-source-of-truth, INV-4). The returned
     // conditions are what the parent coin must emit to create the launcher coin.
@@ -344,6 +343,7 @@ pub fn mint_datastore_launch_with_kind(
         owner_puzzle_hash.into(),
         delegated_puzzles,
     )?;
+    assert_minted_singleton_amount_is_odd(datastore.coin.amount)?;
 
     // Override the launcher CREATE_COIN memos to the two-memo owner-discovery hint (SPEC §9). This is
     // the byte-identity requirement: the raw SDK mint emits only a single default hint, which matches
@@ -363,23 +363,31 @@ pub fn mint_datastore_launch_with_kind(
     })
 }
 
-/// Fails closed unless `launcher_coin` could actually function as a store launcher.
+/// Fails closed unless the caller's [`Launcher`] could actually mint a spendable store singleton.
 ///
-/// This is a check on the coin the CALLER supplied, and it is deliberately separate from the
-/// reachability guard below, which cannot substitute for it: the launch conditions are derived from
-/// this coin's own puzzle hash and amount, so "the conditions create this coin" is true by
-/// construction for every caller-supplied launcher and says nothing about whether the coin is legal.
+/// This is a check on what the CALLER supplied, and it is deliberately separate from the reachability
+/// guard below, which cannot substitute for it: the launch conditions are derived from the launcher
+/// coin's own puzzle hash and amount, so "the conditions create this coin" is true by construction for
+/// every caller-supplied launcher and says nothing about whether the launch is legal.
 ///
 /// Two properties, each catching a bundle the chain would otherwise accept or silently mishandle:
 ///
 /// - **The singleton launcher puzzle hash.** A launcher at any other puzzle hash never mints a
 ///   singleton, and [`override_launcher_hint`] — which matches on this same constant — would silently
 ///   leave the owner-discovery memos unwritten.
-/// - **An ODD amount.** A singleton's amount must stay odd; an even-amount launch is ACCEPTED on
-///   chain and produces a store whose every subsequent spend raises, so it can never be updated or
-///   melted. That failure is irreversible and surfaces only much later, which is why it is refused
-///   at build time.
-fn assert_launcher_coin_is_legal(launcher_coin: Coin) -> MerkleResult<()> {
+/// - **An ODD `singleton_amount`.** A singleton's amount must stay odd; an even-amount store is
+///   ACCEPTED on chain and every subsequent spend of it raises, so it can never be updated or melted
+///   and its mojos are burned. That failure is irreversible and surfaces only much later, which is
+///   why it is refused at build time.
+///
+/// **The invariant lives on the SINGLETON's amount, never the launcher coin's.**
+/// [`Launcher::singleton_amount`] is a separate SDK field that merely DEFAULTS to the launcher coin's
+/// amount and can be overridden ([`Launcher::with_singleton_amount`]); the minted store's amount is
+/// always that field. Reading the launcher coin's amount instead would both admit a 1-mojo launcher
+/// minting an even singleton (a frozen store reported as success) and refuse the SDK's own documented
+/// composition, a 0-amount launcher minting a 1-mojo singleton — which is perfectly legal, because the
+/// launcher coin's own amount is not an invariant at all.
+fn assert_launcher_is_legal(launcher_coin: Coin, singleton_amount: u64) -> MerkleResult<()> {
     if launcher_coin.puzzle_hash != SINGLETON_LAUNCHER_PUZZLE_HASH {
         return Err(MerkleError::Chain(format!(
             "the supplied launcher coin's puzzle hash is {}, not the singleton launcher puzzle — it \
@@ -388,12 +396,22 @@ fn assert_launcher_coin_is_legal(launcher_coin: Coin) -> MerkleResult<()> {
         )));
     }
 
-    if launcher_coin.amount % 2 == 0 {
+    assert_minted_singleton_amount_is_odd(singleton_amount)
+}
+
+/// Fails closed unless a minted store singleton's `amount` is ODD.
+///
+/// Called twice on purpose. Once on the caller's declared [`Launcher::singleton_amount`], where it can
+/// name the mistake before anything is built; and once on `datastore.coin.amount` — the amount the SDK
+/// ACTUALLY minted — after the launch is constructed. The second call is the class-level guard: it
+/// holds however the `Launcher` was configured, so a future SDK builder field that steers the minted
+/// amount cannot silently reopen the frozen-store hole.
+fn assert_minted_singleton_amount_is_odd(singleton_amount: u64) -> MerkleResult<()> {
+    if singleton_amount % 2 == 0 {
         return Err(MerkleError::Chain(format!(
-            "the supplied launcher coin's amount is {}, which is even — a singleton's amount must be \
-             odd, and an even-amount launch is accepted on chain but produces a store that can never \
-             be updated or melted",
-            launcher_coin.amount
+            "the store singleton's amount would be {singleton_amount}, which is even — a singleton's \
+             amount must be odd, and an even-amount launch is accepted on chain but produces a store \
+             that can never be updated or melted"
         )));
     }
 
@@ -1328,6 +1346,53 @@ mod tests {
                  {result:?}"
             );
         }
+    }
+
+    /// LOAD-BEARING: the frozen-store guard reads the SINGLETON's amount, not the launcher coin's.
+    ///
+    /// [`Launcher::singleton_amount`] is its own SDK field: it merely DEFAULTS to the launcher coin's
+    /// amount and [`Launcher::with_singleton_amount`] overrides it, while the minted singleton's
+    /// amount is always `singleton_amount`. A guard reading `launcher.coin().amount` therefore checks
+    /// a value that does not decide anything — and this is the bundle it lets through: a legal-looking
+    /// 1-mojo launcher minting an EVEN-amount singleton, which is accepted on chain and permanently
+    /// frozen.
+    #[test]
+    fn an_even_singleton_amount_is_refused_even_from_an_odd_launcher() {
+        let parent_id = Bytes32::new([0x71; 32]);
+        let launcher = Launcher::new(parent_id, 1).with_singleton_amount(2);
+        assert_eq!(
+            launcher.coin().amount,
+            1,
+            "the launcher coin itself looks legal"
+        );
+
+        let result = launch_with(&mut SpendContext::new(), launcher);
+
+        assert!(
+            matches!(result, Err(MerkleError::Chain(ref message)) if message.contains("singleton")),
+            "an even SINGLETON amount must be refused however legal the launcher coin looks, got: \
+             {result:?}"
+        );
+    }
+
+    /// LOAD-BEARING, the other direction: the SDK's own documented composition — a ZERO-amount
+    /// launcher minting a 1-mojo singleton — is ACCEPTED.
+    ///
+    /// The launcher coin's amount is not the invariant; 0 is legal for it. A guard that refused this
+    /// would reject the legal composition while admitting the illegal one above — the exact signature
+    /// of reading the wrong field.
+    #[test]
+    fn a_zero_amount_launcher_minting_an_odd_singleton_is_accepted() {
+        let parent_id = Bytes32::new([0x71; 32]);
+        let launcher = Launcher::new(parent_id, 0).with_singleton_amount(1);
+
+        let result = launch_with(&mut SpendContext::new(), launcher);
+
+        assert!(
+            result.is_ok(),
+            "a 0-amount launcher minting a 1-mojo singleton is the SDK's documented composition and \
+             must be accepted, got: {result:?}"
+        );
     }
 
     /// The MEASUREMENT the even-amount guard rests on: an even-amount launch is ACCEPTED on chain,

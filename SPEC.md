@@ -137,9 +137,15 @@ The construction, byte-for-byte:
 ### §3.1a `mint_datastore_launch_with_kind` — the composable launch
 
 ```rust
+#[non_exhaustive]
 pub struct DatastoreLaunch {
     pub parent_conditions: Conditions,
     pub datastore: DataStore<DigDataStoreMetadata>,
+    /// Whether this launch WROTE the launcher memos (the owner-discovery hint AND the
+    /// `StoreKind` discriminator, §9). `true` for a direct launch; `false` for an
+    /// intermediate launch, whose launcher `CREATE_COIN` this crate does not author.
+    /// Measured from the rewrite, never inferred.
+    pub launcher_memos_written: bool,
 }
 
 pub fn mint_datastore_launch_with_kind(
@@ -188,11 +194,27 @@ instead. The `kind` argument is therefore ACCEPTED BUT NOT HONOURED under shape 
 this as `DatastoreLaunch.launcher_memos_written == false`, which a caller MUST check when
 memo-scannability matters.
 
-**A PROFILE store MUST be memo-scannable, so shape 2 is NOT the profile-launch shape.** The supported
-profile chain is `DID coin -> ordinary EVEN-amount coin -> launcher (memos intact) -> store`: the DID
-singleton creates an ordinary coin at an even amount, and THAT coin launches with shape 1, which does
-write both memos. This is legal because the one-odd-`CREATE_COIN` restriction binds the *singleton's*
-inner puzzle, not an ordinary coin. Shape 2 is for launches where memo-scannability is not required.
+**The two shapes trade memo-scannability against lineage-resolvability, and a DID-rooted launch MUST
+choose one.** Neither shape delivers both, and the choice is the caller's:
+
+- **Shape 2 (intermediate)** is LINEAGE-RESOLVABLE — `resolve_owner_did` (§3.7) traverses the
+  intermediate hop and names the owning DID — but NOT memo-scannable: it writes no launcher memos, so
+  neither the owner hint nor the `StoreKind` discriminator reaches the chain.
+- **`DID coin -> ordinary EVEN-amount coin -> launcher -> store`, with the ordinary coin launching by
+  shape 1**, is MEMO-SCANNABLE — both memos are written — but NOT lineage-resolvable: the launcher's
+  creator is an ordinary coin, which is neither a DID nor the recognised intermediate launcher, so
+  §3.7 returns `Ok(None)` and the store reports as not-DID-owned. This chain is legal on chain
+  because the one-odd-`CREATE_COIN` restriction binds the *singleton's* inner puzzle, not an
+  ordinary coin. Tracked as **#2463**.
+
+§3.7 MUST NOT be extended over that ordinary hop by inspection alone: an ordinary coin's outputs are
+knowable only by EXECUTING its puzzle — the chain-supplied CLVM the walk exists to never run — and
+accepting the parent claim unexamined would let any store whose launcher's parent happened to be
+DID-created falsely claim DID ownership.
+
+**Neither shape puts a DID reference on chain in a memo.** The owner-discovery hint encodes
+`owner_puzzle_hash` (§9), not a DID, so a memo scan identifies the OWNER PUZZLE, never the DID; DID
+attribution comes only from the §3.7 lineage walk.
 
 **Bundle balance.** Under shape 2 a zero-amount coin creates a 1-mojo launcher, so the surrounding
 spend bundle MUST supply that mojo from another spend. Chia balances a bundle in aggregate, not per
