@@ -347,10 +347,16 @@ pub fn mint_datastore_launch_with_kind(
         delegated_puzzles,
     )?;
     // UNEXERCISED BY CONSTRUCTION on chia-wallet-sdk 0.34: the minted amount is always the
-    // `singleton_amount` already checked above, so no input reaches this check first and deleting it
-    // leaves every test green. It is kept deliberately, against a future SDK builder field that steers
-    // the minted amount independently — the failure it guards (a permanently frozen store) is
-    // irreversible, and this is the last point at which it is still catchable.
+    // `singleton_amount` already checked in `assert_launcher_is_legal`, so no input reaches this check
+    // first and deleting it leaves every test green. It is kept deliberately, against a future SDK
+    // builder field that steers the minted amount independently — the failure it guards (a permanently
+    // frozen store) is irreversible, and this is the last point at which it is still catchable.
+    //
+    // The two checks are redundant on the AMOUNT and NOT on the EFFECT, which is why neither replaces
+    // the other. `Launcher::mint_datastore` has already staged the launcher coin spend into the
+    // CALLER's context by the time this line runs, so refusing here cannot be atomic; the pre-check
+    // is what makes a refused launch leave that context untouched, and it carries that property as a
+    // tested one (`a_refused_launch_stages_nothing_into_the_callers_context`).
     assert_minted_singleton_amount_is_odd(datastore.coin.amount)?;
 
     // Override the launcher CREATE_COIN memos to the two-memo owner-discovery hint (SPEC §9). This is
@@ -414,12 +420,18 @@ fn assert_launcher_is_legal(launcher_coin: Coin, singleton_amount: u64) -> Merkl
 
 /// Fails closed unless a minted store singleton's `amount` is ODD.
 ///
-/// Called twice on purpose. Once on the caller's declared [`Launcher::singleton_amount`], where it can
-/// name the mistake before anything is built; and once on `datastore.coin.amount` — the amount the SDK
-/// ACTUALLY minted — after the launch is constructed. On the current SDK those two values are always
-/// equal, so the second call is unreachable-in-practice rather than independently verified; it exists
-/// so a future builder field that steers the minted amount cannot silently reopen the frozen-store
-/// hole.
+/// Called twice on purpose, and the two calls are redundant on the AMOUNT but not on the EFFECT.
+///
+/// The FIRST runs on the caller's declared [`Launcher::singleton_amount`], BEFORE anything is built —
+/// which is what makes a refusal atomic with respect to the caller's [`SpendContext`], since
+/// [`Launcher::mint_datastore`] stages the launcher coin spend into it. That property is tested
+/// (`a_refused_launch_stages_nothing_into_the_callers_context`) and is why this call cannot be dropped
+/// in favour of the second.
+///
+/// The SECOND runs on `datastore.coin.amount` — the amount the SDK ACTUALLY minted. On the current SDK
+/// those two values are always equal, so it is unreachable-in-practice rather than independently
+/// verified; it exists so a future builder field that steers the minted amount cannot silently reopen
+/// the frozen-store hole.
 fn assert_minted_singleton_amount_is_odd(singleton_amount: u64) -> MerkleResult<()> {
     if singleton_amount % 2 == 0 {
         return Err(MerkleError::Chain(format!(
@@ -1511,6 +1523,47 @@ mod tests {
             "the foreign launcher passes through with exactly the memos it arrived with"
         );
         Ok(())
+    }
+
+    /// LOAD-BEARING: a REFUSED launch stages nothing into the caller's [`SpendContext`].
+    ///
+    /// This is the property that makes the pre-construction legality check irreplaceable by the
+    /// post-mint one, even though the two are redundant on the AMOUNT (`datastore.coin.amount` is
+    /// always `launcher.singleton_amount()` on the current SDK). They differ on the EFFECT:
+    /// `Launcher::mint_datastore` inserts the launcher coin spend into the caller's context before a
+    /// post-mint check could fire, so refusing there would leave that spend behind.
+    ///
+    /// The hazard is specific to this crate's documented usage — the caller owns the context and
+    /// "drains it ONCE, at the end". A caller composing several launches into one context, catching
+    /// the `Err` for a bad one and draining once, would broadcast an orphan launcher spend for a coin
+    /// no `CREATE_COIN` ever creates, killing the whole bundle including the good launches. So
+    /// refusal must be ATOMIC with respect to the caller's context.
+    ///
+    /// The accepted half is what stops this reading as "an unused context is empty": the same context
+    /// DOES accumulate spends when a launch succeeds.
+    #[test]
+    fn a_refused_launch_stages_nothing_into_the_callers_context() {
+        let parent_id = Bytes32::new([0x71; 32]);
+
+        // The bypass shape: a launcher coin that looks entirely legal, minting an EVEN singleton.
+        let ctx = &mut SpendContext::new();
+        let refused = launch_with(ctx, Launcher::new(parent_id, 1).with_singleton_amount(2));
+        assert!(refused.is_err(), "the even-amount launch must be refused");
+        assert_eq!(
+            ctx.iter().count(),
+            0,
+            "a refused launch must leave the caller's context untouched — a stranded launcher spend \
+             would be drained with the caller's other launches and orphan the whole bundle"
+        );
+
+        // Control, same context: an accepted launch DOES stage spends, so the assertion above is
+        // about refusal rather than about a context nothing ever wrote to.
+        let _accepted = launch_with(ctx, Launcher::new(parent_id, 1))
+            .expect("an odd-amount launch is accepted");
+        assert!(
+            ctx.iter().count() > 0,
+            "an accepted launch stages the launcher and eve-DataStore spends (control)"
+        );
     }
 
     /// The MEASUREMENT the even-amount guard rests on: an even-amount launch is ACCEPTED on chain,
