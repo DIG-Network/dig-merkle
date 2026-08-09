@@ -186,6 +186,27 @@ A singleton's inner puzzle MAY emit exactly ONE odd-amount `CREATE_COIN` — its
 shape 1 from a singleton parent builds cleanly and is REJECTED on chain (a CLVM raise). Shape 2 is
 therefore MANDATORY for a singleton parent, and shape 1 MUST NOT be used with one.
 
+**Launcher legality.** Before building anything, the supplied `launcher` MUST be checked and the
+launch MUST fail closed with `MerkleError::Chain` unless BOTH hold:
+
+- `launcher.coin().puzzle_hash` is the singleton launcher puzzle hash. Any other puzzle hash never
+  mints a singleton, and the §9 memo override — which matches that same launcher coin — would
+  silently write no memos.
+- `launcher.singleton_amount()` is ODD. This is the SINGLETON's amount, NOT the launcher coin's: the
+  launcher coin's amount is not an invariant (a 0-amount launcher minting a 1-mojo singleton is
+  legal), while an EVEN singleton amount produces a store that is ACCEPTED on chain and permanently
+  frozen — every later `update_root` and `melt` raises, so it can never be spent again and its mojos
+  are burned.
+
+The odd-amount property MUST additionally be re-checked on the amount the launch ACTUALLY minted
+(`datastore.coin.amount`) after construction, so the guard holds however the `Launcher` was
+configured. Build time is the only point at which a frozen store is still reversible.
+
+**The §9 memo override MUST target the launcher by full COIN ID**, not by the launcher puzzle hash: a
+caller-supplied `Launcher` may carry base conditions containing another store's launcher
+`CREATE_COIN`, and stamping that one too would index a store this launch does not own under this
+owner hint and `StoreKind`.
+
 **A launcher created via an intermediate carries NO owner-discovery memos.** The two-memo hint lives
 on the launcher `CREATE_COIN`, which under shape 2 is emitted by the intermediate coin's own fixed
 puzzle; dig-merkle cannot write memos onto it. Such a store is NOT discoverable by a launcher-memo
@@ -220,10 +241,10 @@ attribution comes only from the §3.7 lineage walk.
 spend bundle MUST supply that mojo from another spend. Chia balances a bundle in aggregate, not per
 coin; a bundle without the surplus is rejected as a minting coin.
 
-Returns `MerkleCoinSpend { coin_spends: [launcher spend, parent/owner spend], child: Some(eve
-DataStore) }`, unsigned (INV-3). **Signing:** an `Owner::Standard` mint requires exactly one
-`AGG_SIG_ME` over the owner's synthetic key on the parent/owner spend (never `AGG_SIG_UNSAFE`); a
-custom/DID inner owns its own requirement.
+**Signing.** This function returns no coin spends of its own — the caller composes and signs the
+parent spend it authorizes. The staged launcher and eve-DataStore spends require no signature; a
+standard-p2 parent spend requires exactly one `AGG_SIG_ME` over the owner's synthetic key (never
+`AGG_SIG_UNSAFE`), and a DID-authorized or otherwise custom parent owns its own requirement.
 
 **Root encoding.** The anchored `root_hash` is the first atom of the NFT-state-layer metadata CLVM
 `(root_hash . (("l" . label)? ("d" . description)? ("sp" . size_proof)? ("p" . program_hash)?
@@ -235,8 +256,10 @@ custom/DID inner owns its own requirement.
 
 `update_root(store, owner, new_metadata)` recreates the coin with a new `root_hash` (and optional
 metadata), preserving `launcher_id`, delegation set, and owner. Authorized by the owner OR a
-`Writer`/`Admin` delegated puzzle. **Signing:** the authorizing inner puzzle's `AGG_SIG_ME`
-(`Owner::Standard` → one signature over the owner key; a custom/delegated inner owns its own).
+`Writer`/`Admin` delegated puzzle. **Signing:** one `AGG_SIG_ME` over the owner key.
+`Owner::Custom` MUST be REJECTED with `MerkleError::UnsupportedOwner`: the metadata-update and
+recreation conditions are built inside the call, so a pre-built inner spend cannot contain them and
+the returned bundle would ignore `new_metadata` or melt the store by omitting the recreation.
 **`program_hash` on update:** metadata is replaced wholesale, so an update that means to KEEP a
 store's `program_hash` MUST re-send it in `new_metadata`; omitting it DROPS the anchor (sets it back
 to `None`).
@@ -257,7 +280,14 @@ paying the fixed oracle fee to the oracle puzzle hash. **Signing:** none from di
 ### 3.5 melt
 
 `melt(store, owner)` terminally spends the coin, producing no child (`child == None`). **Signing:**
-the owner's `AGG_SIG_ME`.
+the owner's `AGG_SIG_ME`. `Owner::Custom` MUST be REJECTED with `MerkleError::UnsupportedOwner`: the
+`MELT_SINGLETON` condition is built inside the call, so a pre-built inner spend cannot contain it and
+the returned bundle would melt nothing while reporting success.
+
+**`Owner::Custom` is unusable across the whole public API.** A `Spend` holds CLVM node pointers valid
+only in the allocator that built them, and no public operation exposes its `SpendContext` for a caller
+to build one in. A custom/DID-authorized parent composes a launch through §3.1a instead, building its
+own spend in its own context.
 
 ### 3.6 read
 
@@ -277,8 +307,8 @@ resolve_owner_did<C: ChainSource>(store_id, chain) -> MerkleResult<Option<DidRef
 
 Recovers the DID that OWNS a store (the complement of `dig-did` #1219: dig-did MINTS a DID-owned
 store, this READS the ownership back). A store rooted in a DID has its launcher coin created by
-spending a DID-authorized coin; `resolve_owner_did` walks that lineage ONE hop up and recognises the
-creator as a DID:
+spending a DID-authorized coin; `resolve_owner_did` walks that lineage up — one creator hop, or two
+through an intermediate-launcher coin — and recognises the creator as a DID:
 
 1. `chain.coin_spend(store_id)?` → the launcher coin's spend (`store_id == launcher_id`). Missing →
    `Ok(None)`.
@@ -289,15 +319,38 @@ creator as a DID:
    ONE further hop: `chain.coin_spend(creator_spend.coin.parent_coin_info)` →
    `did_ref_from_spend(..)`. Missing → `Ok(None)`.
 
+Every spend the walk consumes MUST be bound to the coin it claims to be, in BOTH directions: the
+spend's `coin.coin_id()` MUST equal the id that was asked for, AND its `puzzle_reveal` MUST hash to
+`coin.puzzle_hash`. A coin id is derived from the coin's own fields, so the first binding alone is
+satisfied by any reveal whatsoever; without the second, a source that returns a genuine coin paired
+with a forged reveal can have a DID attributed to a store that has none.
+
 **The walk is BOUNDED at two creator hops, and the second MUST be earned.** A singleton parent
 interposes an intermediate coin (§3.1a), so the DID sits two hops above the launcher; without step 5
 a DID-rooted store resolves as NOT DID-owned. Step 5 MUST NOT be a general parent walk: an unbounded
 climb over coin records an untrusted `ChainSource` controls is a DoS, and it would attribute an
 ordinary store to a DID that merely created its funding coin. The step is taken ONLY when the creator
-is STRUCTURALLY that intermediate — a coin of amount 0 whose spend creates exactly ONE coin, and that
-coin IS this store's launcher (identity by full coin id). Recognition is by shape, not by puzzle hash,
-so it holds for any `mint_number`/`mint_total`. Anything else, and any parse or evaluation failure,
-stops the walk at `Ok(None)`. A DID three or more hops above the launcher is NOT reported.
+IS that intermediate, recognised by its PUZZLE:
+
+- the creator coin's amount is 0, and its `puzzle_reveal` hashes to its own `coin.puzzle_hash`;
+- that reveal uncurries to the `nft_intermediate_launcher` mod hash with its curried
+  `launcher_puzzle_hash` bound to the singleton launcher puzzle hash; and
+- the launcher that puzzle NECESSARILY creates — `Coin::new(creator.coin_id(), launcher_puzzle_hash,
+  1)`, DERIVED analytically because the puzzle is fixed — IS this store's launcher, by full coin id.
+
+The curried `mint_number`/`mint_total` are deliberately unconstrained: they vary the curried puzzle
+hash but not the behaviour.
+
+**Recognition MUST be by puzzle hash with an analytic launcher derivation, and MUST NOT be by shape**
+(e.g. "a 0-amount coin whose spend creates exactly one coin"), for two reasons. First, the walk MUST
+run NO chain-supplied CLVM: the spend comes from an untrusted `ChainSource`, so evaluating it executes
+an attacker's program — a few bytes of non-terminating puzzle burn CPU while the walk still returns
+`Ok(None)`, surfacing to the caller as latency and never as an error. Uncurrying parses; it does not
+execute. Second, shape is a looser bind: it admits ANY puzzle that happens to emit that one condition,
+not just the intermediate launcher the walk means to traverse.
+
+Anything else, and any parse failure, stops the walk at `Ok(None)`. A DID three or more hops above the
+launcher is NOT reported.
 
 It is **fail-closed to `Ok(None)`** at every missing/non-DID/unexpected step (never an error for "not
 DID-owned") and **READ-ONLY** — it never signs, spends, or broadcasts. All chain access is delegated

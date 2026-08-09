@@ -296,11 +296,14 @@ pub struct DatastoreLaunch {
 /// invisible to a launcher-memo scan and is discovered only by the lineage walk in
 /// [`crate::resolve_owner_did`], which traverses the intermediate hop.
 ///
-/// **A PROFILE store must be memo-scannable, so the intermediate is NOT the profile-launch shape.**
-/// The supported profile chain is `DID coin -> ordinary EVEN-amount coin -> launcher (memos intact)
-/// -> store`: the singleton creates an ordinary even-amount coin, and THAT coin launches directly.
-/// This is legal because the one-odd-`CREATE_COIN` restriction binds the *singleton's* inner puzzle,
-/// not an ordinary coin. Use the intermediate shape only where memo-scannability is not required.
+/// **The two shapes trade memo-scannability against lineage-resolvability, and a DID-rooted launch
+/// must choose.** The intermediate shape is resolvable by [`crate::resolve_owner_did`] but writes no
+/// memos. The alternative — `DID coin -> ordinary EVEN-amount coin -> launcher -> store`, where the
+/// singleton creates an ordinary even-amount coin and THAT coin launches directly — does write both
+/// memos, but is NOT resolvable: the launcher's creator is an ordinary coin, which is neither a DID
+/// nor the recognised intermediate launcher, so the walk returns `Ok(None)` (known gap, #2463). Both
+/// are legal on chain, because the one-odd-`CREATE_COIN` restriction binds the *singleton's* inner
+/// puzzle, not an ordinary coin.
 ///
 /// # Errors
 ///
