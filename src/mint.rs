@@ -260,8 +260,18 @@ pub struct DatastoreLaunch {
 ///   chain. `IntermediateLauncher` creates its intermediate coin at amount 0 (even); only that coin
 ///   creates the odd launcher.
 ///
-/// Either way the launcher's `CREATE_COIN` chain is verified before returning (see the errors below),
-/// so a shape that cannot launch is refused rather than handed back as a success.
+/// The launcher coin itself is checked for LEGALITY — the singleton launcher puzzle hash, and an ODD
+/// amount — and its `CREATE_COIN` chain is then checked for REACHABILITY. The two are independent:
+/// reachability alone is satisfied by construction for any caller-supplied launcher, because the
+/// conditions are built from that same coin's fields.
+///
+/// The odd-amount check exists because `Launcher::new(parent, 0)` is the plausible transposition of
+/// `IntermediateLauncher::new(parent, 0, 1)` — whose second argument is a `mint_number`, NOT an
+/// amount — and the two constructors are recommended two lines apart above. An even-amount launcher
+/// builds cleanly AND is accepted on chain, and only then is the store discovered to be permanently
+/// frozen: the singleton odd-amount rule makes every later `update_root` raise, so the store can
+/// never be updated or melted and the mojos are burned. Refusing it here is the only point at which
+/// that is still reversible.
 ///
 /// # The owner-discovery memos need a DIRECT launcher (SPEC §3.7), and `kind` rides on them
 ///
@@ -285,8 +295,10 @@ pub struct DatastoreLaunch {
 /// # Errors
 ///
 /// Returns [`MerkleError::Driver`] if the SDK fails to construct the launcher, and
-/// [`MerkleError::Chain`] if the built conditions do not lead to the launcher coin — a fail-closed
-/// class guard, so an unlaunchable bundle can never be returned as a success.
+/// [`MerkleError::Chain`] if the supplied launcher coin is not a legal launcher (wrong puzzle hash,
+/// or an even amount) or if the built conditions do not lead to it. Together these are fail-closed
+/// class guards, so neither an unlaunchable bundle nor one that launches a permanently frozen store
+/// can be returned as a success.
 #[allow(clippy::too_many_arguments)]
 pub fn mint_datastore_launch_with_kind(
     ctx: &mut SpendContext,
@@ -304,6 +316,7 @@ pub fn mint_datastore_launch_with_kind(
     // The launcher coin is fixed the moment the caller builds the `Launcher`; capture it before the
     // builder consumes it, so the chain guard below can verify the conditions actually reach it.
     let launcher_coin = launcher.coin();
+    assert_launcher_coin_is_legal(launcher_coin)?;
 
     // Build the launcher + eve DataStore via the SDK (the byte-source-of-truth, INV-4). The returned
     // conditions are what the parent coin must emit to create the launcher coin.
@@ -337,6 +350,43 @@ pub fn mint_datastore_launch_with_kind(
         datastore,
         launcher_memos_written,
     })
+}
+
+/// Fails closed unless `launcher_coin` could actually function as a store launcher.
+///
+/// This is a check on the coin the CALLER supplied, and it is deliberately separate from the
+/// reachability guard below, which cannot substitute for it: the launch conditions are derived from
+/// this coin's own puzzle hash and amount, so "the conditions create this coin" is true by
+/// construction for every caller-supplied launcher and says nothing about whether the coin is legal.
+///
+/// Two properties, each catching a bundle the chain would otherwise accept or silently mishandle:
+///
+/// - **The singleton launcher puzzle hash.** A launcher at any other puzzle hash never mints a
+///   singleton, and [`override_launcher_hint`] — which matches on this same constant — would silently
+///   leave the owner-discovery memos unwritten.
+/// - **An ODD amount.** A singleton's amount must stay odd; an even-amount launch is ACCEPTED on
+///   chain and produces a store whose every subsequent spend raises, so it can never be updated or
+///   melted. That failure is irreversible and surfaces only much later, which is why it is refused
+///   at build time.
+fn assert_launcher_coin_is_legal(launcher_coin: Coin) -> MerkleResult<()> {
+    if launcher_coin.puzzle_hash != SINGLETON_LAUNCHER_HASH {
+        return Err(MerkleError::Chain(format!(
+            "the supplied launcher coin's puzzle hash is {}, not the singleton launcher puzzle — it \
+             would not mint a store singleton",
+            launcher_coin.puzzle_hash
+        )));
+    }
+
+    if launcher_coin.amount % 2 == 0 {
+        return Err(MerkleError::Chain(format!(
+            "the supplied launcher coin's amount is {}, which is even — a singleton's amount must be \
+             odd, and an even-amount launch is accepted on chain but produces a store that can never \
+             be updated or melted",
+            launcher_coin.amount
+        )));
+    }
+
+    Ok(())
 }
 
 /// Fails closed unless the parent's `conditions` actually lead to `launcher_coin`.
@@ -1225,6 +1275,76 @@ mod tests {
             "the intermediate coin sits between the singleton and the launcher"
         );
         Ok(())
+    }
+
+    /// Builds a launch with a caller-supplied launcher, for the legality tests below. Every argument
+    /// except the launcher is the same as the accepted reference launch, so the launcher coin is the
+    /// only variable.
+    fn launch_with(ctx: &mut SpendContext, launcher: Launcher) -> MerkleResult<DatastoreLaunch> {
+        let (_owner_pk, owner_ph) = seeded_owner();
+        mint_datastore_launch_with_kind(
+            ctx,
+            StoreKind::File,
+            launcher,
+            Bytes32::new([0x6d; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            vec![],
+        )
+    }
+
+    /// LOAD-BEARING: an EVEN-amount launcher is refused at build time.
+    ///
+    /// Measured on the simulator: such a bundle is ACCEPTED on chain, and the resulting store is
+    /// permanently frozen — the singleton odd-amount rule makes every later `update_root` raise, so
+    /// it can never be updated or melted and its mojos are burned. Nothing downstream reports this,
+    /// so build time is the only place it is still reversible.
+    ///
+    /// The reachability guard cannot catch it: the launch conditions are built FROM the launcher's
+    /// own amount, so "the conditions create this coin" holds for any amount whatsoever.
+    #[test]
+    fn an_even_amount_launcher_is_refused() {
+        let parent_id = Bytes32::new([0x71; 32]);
+        for amount in [0, 2] {
+            let result = launch_with(&mut SpendContext::new(), Launcher::new(parent_id, amount));
+            assert!(
+                matches!(result, Err(MerkleError::Chain(ref message)) if message.contains("even")),
+                "an amount-{amount} launcher must be refused as an even singleton amount, got: \
+                 {result:?}"
+            );
+        }
+    }
+
+    /// LOAD-BEARING: the ODD amount the caller is told to use is accepted, so the guard above refuses
+    /// the illegal amounts rather than the whole argument.
+    #[test]
+    fn an_odd_amount_launcher_is_accepted() {
+        let parent_id = Bytes32::new([0x71; 32]);
+        assert!(launch_with(&mut SpendContext::new(), Launcher::new(parent_id, 1)).is_ok());
+        assert!(launch_with(&mut SpendContext::new(), Launcher::new(parent_id, 3)).is_ok());
+    }
+
+    /// LOAD-BEARING: a launcher coin at any puzzle hash other than the singleton launcher is refused.
+    ///
+    /// It could never mint a singleton, and [`override_launcher_hint`] matches on that same puzzle
+    /// hash — so without this guard the launch would also silently omit the owner-discovery memos
+    /// while still reporting success.
+    #[test]
+    fn a_launcher_coin_at_a_foreign_puzzle_hash_is_refused() {
+        let parent_id = Bytes32::new([0x71; 32]);
+        let foreign = Coin::new(parent_id, Bytes32::new([0x42; 32]), 1);
+        let result = launch_with(
+            &mut SpendContext::new(),
+            Launcher::from_coin(foreign, Conditions::new()),
+        );
+        assert!(
+            matches!(result, Err(MerkleError::Chain(ref message)) if message.contains("puzzle hash")),
+            "a launcher at a foreign puzzle hash must be refused, got: {result:?}"
+        );
     }
 
     /// The memos on the launcher `CREATE_COIN` across `coin_spends`, or `None` when that condition

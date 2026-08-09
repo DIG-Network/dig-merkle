@@ -16,9 +16,10 @@
 //! the creator spend to `did_ref_from_spend`, fail-closed to `Ok(None)` at every missing hop.
 //! dig-merkle itself opens no socket (INV-1) — the caller implements the chain read.
 
-use chia_wallet_sdk::driver::{Did, Puzzle, SpendContext};
-use chia_wallet_sdk::prelude::Allocator;
-use chia_wallet_sdk::types::Condition;
+use chia_puzzle_types::nft::NftIntermediateLauncherArgs;
+use chia_wallet_sdk::driver::{Did, Puzzle};
+use chia_wallet_sdk::prelude::{Allocator, TreeHash};
+use chia_wallet_sdk::puzzles::{NFT_INTERMEDIATE_LAUNCHER_HASH, SINGLETON_LAUNCHER_HASH};
 use clvm_traits::{FromClvm, ToClvm};
 use dig_chainsource_interface::ChainSource;
 
@@ -104,9 +105,12 @@ pub fn did_ref_from_spend(spend: &CoinSpend) -> MerkleResult<Option<DidRef>> {
 /// creates the launcher (SPEC §3.1a). The walk therefore tolerates exactly ONE such hop. It is not a
 /// general parent walk: an unbounded climb over coin records an untrusted source controls is a DoS,
 /// and it would also mis-attribute an ordinary store whose funding coin merely happened to come from
-/// a DID. The second hop is taken only when the creator is *structurally* an intermediate launcher —
-/// a zero-amount coin whose spend creates exactly one coin, and that coin IS this store's launcher.
-/// Anything else stops the walk at `Ok(None)`.
+/// a DID. The second hop is taken only when the creator IS the `nft_intermediate_launcher` puzzle,
+/// curried to the singleton launcher, and the launcher that puzzle necessarily creates is this
+/// store's. Anything else stops the walk at `Ok(None)`.
+///
+/// **The walk runs NO chain-supplied CLVM.** Every step parses or derives; none evaluates. An
+/// untrusted [`ChainSource`] therefore cannot spend the caller's CPU on a program of its choosing.
 ///
 /// It is **fail-closed to `Ok(None)`** at every missing/non-DID/unexpected step — a store that is
 /// simply not DID-owned is `Ok(None)`, never an error — and READ-ONLY (never signs, spends, or
@@ -193,39 +197,58 @@ fn read_bound_spend<C: ChainSource>(
 /// Whether `spend` is the intermediate-launcher coin that created `launcher_coin` — the single hop
 /// the owner walk is allowed to traverse (SPEC §3.1a/§3.7).
 ///
-/// Recognised by SHAPE, not by puzzle hash, so it holds for any `mint_number`/`mint_total` the caller
-/// chose: a zero-amount coin (the even output a singleton parent is permitted to make alongside its
-/// successor) whose spend creates exactly one coin, and that coin IS this store's launcher. An
-/// ordinary funding coin that merely happens to descend from a DID fails the amount check, so the
-/// walk cannot climb through it and mis-attribute the store. Any parse or evaluation failure is
-/// `false` — fail closed.
+/// Recognised by the coin's actual PUZZLE: the uncurried `nft_intermediate_launcher` mod hash, with
+/// its curried `launcher_puzzle_hash` argument bound to the singleton launcher. Because that puzzle
+/// is fixed, its one `CREATE_COIN` is fully determined by the coin it is spending — so the launcher
+/// it produces is DERIVED here rather than observed, and matched by full coin id.
+///
+/// Two reasons this is not recognised by shape instead:
+///
+/// - **It would run chain-supplied CLVM.** The spend comes from an untrusted [`ChainSource`], and
+///   evaluating it means executing an attacker's program: 28 bytes of non-terminating puzzle burns
+///   seconds of CPU at the block cost limit, and the walk still returns `Ok(None)`, so a caller sees
+///   only latency and never an error. Uncurrying parses; it does not execute.
+/// - **Shape is a looser bind than the puzzle.** "A 0-amount coin whose spend creates exactly this
+///   launcher" admits ANY puzzle that happens to emit that one condition, not just the intermediate
+///   launcher the walk means to traverse.
+///
+/// The `mint_number`/`mint_total` the caller chose are deliberately not constrained — they vary the
+/// curried puzzle hash but not the behaviour. Any parse failure is `false` — fail closed.
 fn is_launcher_intermediate(spend: &CoinSpend, launcher_coin: Coin) -> bool {
     if spend.coin.amount != 0 {
         return false;
     }
-    let Ok(created) = coins_created_by(spend) else {
+
+    let mut allocator = Allocator::new();
+    let Ok(puzzle_ptr) = spend.puzzle_reveal.to_clvm(&mut allocator) else {
         return false;
     };
-    created.len() == 1 && created[0].coin_id() == launcher_coin.coin_id()
-}
+    let puzzle = Puzzle::parse(&allocator, puzzle_ptr);
 
-/// Runs `spend`'s puzzle against its solution and returns the coins its `CREATE_COIN` conditions make.
-fn coins_created_by(spend: &CoinSpend) -> MerkleResult<Vec<Coin>> {
-    let mut ctx = SpendContext::new();
-    let puzzle = ctx.alloc(&spend.puzzle_reveal)?;
-    let solution = ctx.alloc(&spend.solution)?;
-    let output = ctx.run(puzzle, solution)?;
-    let conditions = Vec::<Condition>::from_clvm(&*ctx, output)
-        .map_err(|error| MerkleError::Parse(format!("creator spend conditions: {error}")))?;
+    // The reveal must be the coin it claims to be; a chain source that returns a different puzzle
+    // than the coin commits to cannot steer the walk.
+    if Bytes32::from(puzzle.curried_puzzle_hash()) != spend.coin.puzzle_hash {
+        return false;
+    }
 
-    let parent_id = spend.coin.coin_id();
-    Ok(conditions
-        .into_iter()
-        .filter_map(|condition| match condition {
-            Condition::CreateCoin(cc) => Some(Coin::new(parent_id, cc.puzzle_hash, cc.amount)),
-            _ => None,
-        })
-        .collect())
+    let Some(curried) = puzzle.as_curried() else {
+        return false;
+    };
+    if curried.mod_hash != TreeHash::new(NFT_INTERMEDIATE_LAUNCHER_HASH) {
+        return false;
+    }
+
+    let Ok(args) = NftIntermediateLauncherArgs::from_clvm(&allocator, curried.args) else {
+        return false;
+    };
+    if args.launcher_puzzle_hash != Bytes32::from(SINGLETON_LAUNCHER_HASH) {
+        return false;
+    }
+
+    // The intermediate puzzle's only output is a 1-mojo coin at the curried launcher puzzle hash,
+    // parented by the coin being spent — so the launcher is derivable without running anything.
+    Coin::new(spend.coin.coin_id(), args.launcher_puzzle_hash, 1).coin_id()
+        == launcher_coin.coin_id()
 }
 
 /// Reads the spend that spent `coin_id`, mapping the source's own error into [`MerkleError::Chain`]
@@ -492,6 +515,75 @@ mod tests {
             resolve_owner_did(store_id, &chain)?,
             None,
             "a DID two creators above the launcher is out of the walk's bound"
+        );
+        Ok(())
+    }
+
+    /// LOAD-BEARING: a hostile [`ChainSource`] cannot make the walk EXECUTE a program of its
+    /// choosing.
+    ///
+    /// The fixture is a 7-byte non-terminating puzzle — `(a 1 1)`, which applies its own solution to
+    /// itself forever — presented as the launcher's creator at amount 0, with the coin's puzzle hash
+    /// set to that puzzle's real tree hash so the spend is internally consistent. It therefore
+    /// satisfies every precondition the old shape-based recogniser checked before running the spend,
+    /// which is what makes it discriminating: the previous implementation evaluated it at the full
+    /// mainnet block cost limit (measured: ~7.1s of single-thread CPU in a release build, far worse
+    /// unoptimised) and still answered `Ok(None)`, so a caller saw only unexplained latency.
+    ///
+    /// The elapsed-time bound is the assertion, because the property IS about CPU. The margin is
+    /// enormous by construction — recognising the puzzle without running it is microseconds, and the
+    /// old path could not finish in seconds — so this cannot flake on a slow machine.
+    #[test]
+    fn the_walk_never_runs_a_chain_supplied_puzzle() -> anyhow::Result<()> {
+        use chia_wallet_sdk::clvm_utils::tree_hash;
+        use std::time::Instant;
+
+        // `(a 1 1)`: apply the environment as a program, in that same environment — non-terminating.
+        let hostile_bytes = hex_literal::hex!("ff02ff01ff0180").to_vec();
+        let hostile = crate::types::CoinSpend::new(
+            Coin::new(Bytes32::new([0x9e; 32]), Bytes32::new([0; 32]), 0),
+            hostile_bytes.clone().into(),
+            hostile_bytes.into(),
+        );
+
+        // Bind the coin to the puzzle it reveals, so the fixture passes every check that precedes
+        // the point at which the old implementation would have started executing.
+        let mut allocator = Allocator::new();
+        let puzzle_ptr = hostile.puzzle_reveal.to_clvm(&mut allocator)?;
+        let hostile = crate::types::CoinSpend::new(
+            Coin::new(
+                hostile.coin.parent_coin_info,
+                tree_hash(&allocator, puzzle_ptr).into(),
+                0,
+            ),
+            hostile.puzzle_reveal,
+            hostile.solution,
+        );
+
+        let launcher_coin = Coin::new(
+            hostile.coin.coin_id(),
+            Bytes32::from(SINGLETON_LAUNCHER_HASH),
+            1,
+        );
+        let store_id = launcher_coin.coin_id();
+        let launcher_spend = CoinSpend::new(
+            launcher_coin,
+            hostile.puzzle_reveal.clone(),
+            hostile.solution.clone(),
+        );
+        let chain = MockChainSource::new()
+            .with_spend(store_id, launcher_spend)
+            .with_spend(hostile.coin.coin_id(), hostile);
+
+        let started = Instant::now();
+        let resolved = resolve_owner_did(store_id, &chain)?;
+        let elapsed = started.elapsed();
+
+        assert_eq!(resolved, None, "a hostile creator is not a DID owner");
+        assert!(
+            elapsed.as_secs() < 2,
+            "the walk must recognise the hop without executing chain-supplied CLVM, but took \
+             {elapsed:?}"
         );
         Ok(())
     }
