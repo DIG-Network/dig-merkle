@@ -16,7 +16,10 @@ pub type MerkleResult<T> = Result<T, MerkleError>;
 /// The variants split into two families: errors *delegated* to the chia-wallet-sdk driver/signer
 /// (wrapped verbatim so the underlying cause is never lost), and DataLayer-domain errors this crate
 /// raises itself (parse/hydration/permission guards, all fail-closed per SPEC §5).
+/// Marked `#[non_exhaustive]` so a future failure mode can be added without breaking downstream
+/// `match`es: callers MUST carry a wildcard arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MerkleError {
     /// A chia-wallet-sdk driver operation failed (puzzle currying, spend construction, CLVM
     /// evaluation). The wrapped [`DriverError`] carries the precise cause.

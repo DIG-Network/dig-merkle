@@ -12,7 +12,7 @@ use chia_wallet_sdk::types::Conditions;
 use crate::context::inner_spend;
 use crate::metadata::DigDataStoreMetadata;
 use crate::types::{MerkleCoinSpend, Owner};
-use crate::MerkleResult;
+use crate::{MerkleError, MerkleResult};
 
 /// Terminally spends `store`, producing no successor coin (`child == None`).
 ///
@@ -22,10 +22,18 @@ use crate::MerkleResult;
 ///
 /// # Signing
 ///
-/// An [`Owner::Standard`] melt requires exactly one `AGG_SIG_ME` over the owner's synthetic key; a
-/// custom inner owns its own requirement. Obtain it via [`crate::required_signatures`].
+/// An [`Owner::Standard`] melt requires exactly one `AGG_SIG_ME` over the owner's synthetic key.
+/// Obtain it via [`crate::required_signatures`].
 ///
 /// # Errors
+///
+/// Returns [`MerkleError::UnsupportedOwner`] for [`Owner::Custom`]: the `MELT_SINGLETON` condition is
+/// built inside this call, so a pre-built inner spend cannot contain it and the returned bundle would
+/// melt nothing while reporting success (#2418).
+///
+/// (`Owner::Custom` is in practice unusable across this crate's whole public API: a
+/// [`chia_wallet_sdk::driver::Spend`] holds CLVM node pointers valid only in the allocator that built
+/// them, and no public operation exposes its [`SpendContext`] for the caller to build one in.)
 ///
 /// Returns [`MerkleError::Driver`](crate::MerkleError::Driver) if the SDK fails to build the melt
 /// spend.
@@ -33,6 +41,13 @@ pub fn melt(
     store: &DataStore<DigDataStoreMetadata>,
     owner: Owner,
 ) -> MerkleResult<MerkleCoinSpend> {
+    if matches!(owner, Owner::Custom(_)) {
+        return Err(MerkleError::UnsupportedOwner(
+            "a melt's MELT_SINGLETON condition is built inside this call, so Owner::Custom cannot \
+             emit it — the bundle would melt nothing",
+        ));
+    }
+
     let mut ctx = SpendContext::new();
 
     let conditions = Conditions::new().melt_singleton();
@@ -90,6 +105,32 @@ mod tests {
         assert_eq!(built.coin_spends.len(), 1, "melt is a single coin spend");
 
         sim.spend_coins(built.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
+        Ok(())
+    }
+
+    /// REGRESSION (#2418): a melt MUST refuse [`Owner::Custom`] rather than return a bundle with no
+    /// `MELT_SINGLETON` condition.
+    ///
+    /// `melt` builds the melt condition INSIDE this call, and `context::inner_spend` drops the
+    /// conditions for a custom owner — so accepting one returned `Ok` for a spend that recreates
+    /// nothing and melts nothing. That is #2418's signature verbatim, on a second entry point.
+    #[test]
+    fn a_custom_owner_melt_is_refused() -> anyhow::Result<()> {
+        use chia_wallet_sdk::driver::{SpendContext, SpendWithConditions, StandardLayer};
+
+        let mut sim = Simulator::new();
+        let (owner, store) = minted_store(&mut sim)?;
+
+        let mut ctx = SpendContext::new();
+        let prebuilt = StandardLayer::new(owner.pk)
+            .spend_with_conditions(&mut ctx, chia_wallet_sdk::types::Conditions::new())?;
+
+        let result = melt(&store, Owner::Custom(prebuilt));
+
+        assert!(
+            matches!(result, Err(crate::MerkleError::UnsupportedOwner(_))),
+            "a custom-owner melt must refuse, not return a bundle that never melts, got: {result:?}"
+        );
         Ok(())
     }
 

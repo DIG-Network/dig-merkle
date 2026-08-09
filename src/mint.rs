@@ -14,10 +14,10 @@
 //! [`crate::required_signatures`] and fulfils with its own signer.
 
 use chia_wallet_sdk::driver::{Launcher, SpendContext};
+use chia_wallet_sdk::puzzles::SINGLETON_LAUNCHER_HASH;
 use chia_wallet_sdk::types::conditions::CreateCoin;
 use chia_wallet_sdk::types::{Condition, Conditions};
 use clvm_traits::FromClvm;
-use hex_literal::hex;
 
 use crate::context::{drain_coin_spends, inner_spend};
 use crate::hint::{digstore_owner_hint, launcher_hint_for, StoreKind};
@@ -26,12 +26,15 @@ use crate::size::SizeBucket;
 use crate::types::{Bytes32, Coin, DataStore, DelegatedPuzzle, MerkleCoinSpend, Owner};
 use crate::{MerkleError, MerkleResult};
 
-/// The well-known singleton launcher puzzle hash. A `CREATE_COIN` to this puzzle hash mints the
-/// store's launcher coin (whose `coin_id == launcher_id == store_id`); it is the memo carrier we
-/// override with the owner-discovery hint. Pinned as a literal so the crate self-contains it.
-const SINGLETON_LAUNCHER_HASH: Bytes32 = Bytes32::new(hex!(
-    "eff07522495060c066f66f32acc2a77e3a3e737aca8baea4d1a64ea4cdc13da9"
-));
+/// The well-known singleton launcher puzzle hash, as a coin puzzle hash. A `CREATE_COIN` to it mints
+/// the store's launcher coin (whose `coin_id == launcher_id == store_id`); it is the memo carrier
+/// [`override_launcher_hint`] rewrites with the owner-discovery hint.
+///
+/// Sourced from the SDK constant [`crate::read`] also reads, so the mint's legality guard and the
+/// read recogniser can never compare against two different definitions of one canonical value. (The
+/// ecosystem-wide move of such constants into `dig-constants` is tracked as #2464.)
+const SINGLETON_LAUNCHER_PUZZLE_HASH: Bytes32 =
+    Bytes32::new(SINGLETON_LAUNCHER_HASH);
 
 /// Builds the unsigned spends that mint a new DataLayer store singleton anchoring `root_hash`.
 ///
@@ -150,11 +153,13 @@ pub fn mint_datastore_with_kind(
     // ONE code path with the caller-composed launch (below), so byte identity is structural. An
     // ordinary (non-singleton) parent creates the 1-mojo launcher directly — see
     // [`mint_datastore_launch_with_kind`] for why a singleton parent cannot.
+    // This path always launches directly from an ordinary coin, so the memos are always written; the
+    // flag exists for callers that compose their own launcher shape. The `debug_assert!` below makes
+    // that claim load-bearing rather than a comment that could quietly stop being true.
     let DatastoreLaunch {
         parent_conditions: launch_conditions,
         datastore,
-        // This path always launches directly from an ordinary coin, so the memos are always written;
-        // the flag exists for callers that compose their own launcher shape.
+        launcher_memos_written,
         ..
     } = mint_datastore_launch_with_kind(
         &mut ctx,
@@ -169,6 +174,10 @@ pub fn mint_datastore_with_kind(
         owner_puzzle_hash,
         delegated_puzzles,
     )?;
+    debug_assert!(
+        launcher_memos_written,
+        "a direct launch emits the launcher CREATE_COIN itself, so the memo rewrite must have fired"
+    );
 
     // Return the parent coin's surplus (above the 1-mojo launcher + `fee`) to the owner as change,
     // hinted to their puzzle hash. The fee is thereby paid implicitly (coins in minus coins out).
@@ -203,8 +212,11 @@ pub fn mint_datastore_with_kind(
 /// node pointers that index into the allocator that built them. The launcher-coin and eve-DataStore
 /// spends are already staged into that same context; the caller adds its parent-coin spend and drains
 /// the context ONCE, at the end.
+/// Marked `#[non_exhaustive]` so a future launch fact can be reported without breaking downstream
+/// destructuring: callers MUST use `..` and this crate stays the only constructor.
 #[derive(Debug, Clone)]
 #[must_use]
+#[non_exhaustive]
 pub struct DatastoreLaunch {
     /// What the parent coin's spend must emit: the `CREATE_COIN` that starts the launch — the
     /// launcher itself (carrying the two DIG owner-discovery memos) for a direct launch, or the
@@ -369,7 +381,7 @@ pub fn mint_datastore_launch_with_kind(
 ///   melted. That failure is irreversible and surfaces only much later, which is why it is refused
 ///   at build time.
 fn assert_launcher_coin_is_legal(launcher_coin: Coin) -> MerkleResult<()> {
-    if launcher_coin.puzzle_hash != SINGLETON_LAUNCHER_HASH {
+    if launcher_coin.puzzle_hash != SINGLETON_LAUNCHER_PUZZLE_HASH {
         return Err(MerkleError::Chain(format!(
             "the supplied launcher coin's puzzle hash is {}, not the singleton launcher puzzle — it \
              would not mint a store singleton",
@@ -506,7 +518,7 @@ fn override_launcher_hint(
     for condition in conditions {
         match condition {
             Condition::CreateCoin(create_coin)
-                if create_coin.puzzle_hash == SINGLETON_LAUNCHER_HASH =>
+                if create_coin.puzzle_hash == SINGLETON_LAUNCHER_PUZZLE_HASH =>
             {
                 let memos = ctx.memos(&[
                     digstore_owner_hint(owner_puzzle_hash),
@@ -567,7 +579,7 @@ mod tests {
             let conditions = Vec::<Condition>::from_clvm(&*ctx, output).expect("parse conditions");
             for condition in conditions {
                 if let Condition::CreateCoin(cc) = condition {
-                    if cc.puzzle_hash == SINGLETON_LAUNCHER_HASH {
+                    if cc.puzzle_hash == SINGLETON_LAUNCHER_PUZZLE_HASH {
                         let Memos::Some(ptr) = cc.memos else {
                             panic!("launcher CREATE_COIN must carry memos");
                         };
@@ -1000,7 +1012,7 @@ mod tests {
         for condition in conditions {
             let is_launcher = matches!(
                 &condition,
-                Condition::CreateCoin(cc) if cc.puzzle_hash == SINGLETON_LAUNCHER_HASH
+                Condition::CreateCoin(cc) if cc.puzzle_hash == SINGLETON_LAUNCHER_PUZZLE_HASH
             );
             if !is_launcher {
                 kept = kept.with(condition);
@@ -1107,7 +1119,7 @@ mod tests {
 
         assert!(
             launch.parent_conditions.iter().any(|condition| {
-                matches!(condition, Condition::CreateCoin(cc) if cc.puzzle_hash == SINGLETON_LAUNCHER_HASH)
+                matches!(condition, Condition::CreateCoin(cc) if cc.puzzle_hash == SINGLETON_LAUNCHER_PUZZLE_HASH)
             }),
             "the launch conditions create the launcher coin"
         );
@@ -1319,6 +1331,62 @@ mod tests {
         }
     }
 
+    /// The MEASUREMENT the even-amount guard rests on: an even-amount launch is ACCEPTED on chain,
+    /// and the store it produces is permanently frozen.
+    ///
+    /// The bundle is built straight from the SDK — deliberately NOT through
+    /// [`mint_datastore_launch_with_kind`], whose guard exists precisely to refuse it — so this
+    /// measures the CHAIN's behaviour rather than this crate's. Two halves, both required:
+    ///
+    /// - the launch bundle is accepted by the simulator (nothing rejects it at mint time), and
+    /// - the very next `update_root` on the resulting store is REJECTED, because the singleton puzzle
+    ///   requires an odd amount — so the store can never be updated or melted and its mojos are burned.
+    ///
+    /// Without the second half the first would only show that a bad mint is quiet; without the first,
+    /// the guard could be justified by a failure the chain already catches.
+    #[test]
+    fn an_even_amount_launch_is_accepted_on_chain_and_freezes_the_store() -> anyhow::Result<()> {
+        use chia_wallet_sdk::driver::StandardLayer;
+
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let owner = sim.bls(1_000_000);
+        let owner_ph: Bytes32 = StandardArgs::curry_tree_hash(owner.pk).into();
+
+        // An EVEN-amount launcher — the transposition `Launcher::new(parent, 0)` /
+        // `IntermediateLauncher::new(parent, 0, 1)` produces, here at 2 mojos so the bundle balances.
+        let (launch_conditions, datastore) = Launcher::new(owner.coin.coin_id(), 2).mint_datastore(
+            ctx,
+            DigDataStoreMetadata {
+                root_hash: Bytes32::new([0x5a; 32]),
+                ..Default::default()
+            },
+            owner_ph.into(),
+            vec![],
+        )?;
+        StandardLayer::new(owner.pk).spend(ctx, owner.coin, launch_conditions)?;
+
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&owner.sk))
+            .expect("an even-amount launch is ACCEPTED on chain — nothing refuses it at mint time");
+
+        // …and the store is frozen: its first update raises inside the singleton puzzle.
+        let update = crate::update_root(
+            &datastore,
+            Owner::Standard(owner.pk),
+            DigDataStoreMetadata {
+                root_hash: Bytes32::new([0x77; 32]),
+                ..Default::default()
+            },
+        )?;
+        let result = sim.spend_coins(update.coin_spends, std::slice::from_ref(&owner.sk));
+        assert!(
+            result.is_err(),
+            "an even-amount store must be unspendable — every later update raises on the singleton \
+             odd-amount rule, so the store is permanently frozen, but got: {result:?}"
+        );
+        Ok(())
+    }
+
     /// LOAD-BEARING: the ODD amount the caller is told to use is accepted, so the guard above refuses
     /// the illegal amounts rather than the whole argument.
     #[test]
@@ -1359,7 +1427,7 @@ mod tests {
             let conditions = Vec::<Condition>::from_clvm(&*ctx, output).expect("parse conditions");
             for condition in conditions {
                 if let Condition::CreateCoin(cc) = condition {
-                    if cc.puzzle_hash == SINGLETON_LAUNCHER_HASH {
+                    if cc.puzzle_hash == SINGLETON_LAUNCHER_PUZZLE_HASH {
                         return match cc.memos {
                             Memos::Some(ptr) => Some(
                                 Vec::<Bytes32>::from_clvm(&*ctx, ptr)
@@ -1446,7 +1514,7 @@ mod tests {
             .parent_conditions
             .iter()
             .find_map(|condition| match condition {
-                Condition::CreateCoin(cc) if cc.puzzle_hash == SINGLETON_LAUNCHER_HASH => {
+                Condition::CreateCoin(cc) if cc.puzzle_hash == SINGLETON_LAUNCHER_PUZZLE_HASH => {
                     Some(cc.memos)
                 }
                 _ => None,

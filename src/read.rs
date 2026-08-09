@@ -740,6 +740,88 @@ mod tests {
         Ok(())
     }
 
+    /// PINS A KNOWN GAP, tracked as **#2463** — this is NOT desired behaviour.
+    ///
+    /// The memo-scannable profile chain (`DID coin -> ordinary EVEN-amount coin -> launcher (memos
+    /// intact) -> store`, SPEC §3.1a) is NOT lineage-resolvable: the launcher's creator is an
+    /// ordinary coin, which is neither a DID nor the recognised intermediate launcher, so the walk
+    /// stops at `Ok(None)` and a DID-rooted profile store reports as not-DID-owned.
+    ///
+    /// Extending the walk over that hop is refused deliberately: an ordinary coin's outputs are
+    /// knowable only by EXECUTING its puzzle — the chain-supplied CLVM the walk exists to never run
+    /// (see [`is_launcher_intermediate`]) — and accepting the parent claim unexamined would let any
+    /// store whose launcher's parent happened to be DID-created falsely claim DID ownership.
+    ///
+    /// Every spend here is real and was accepted by the simulator, so this pins what the composition
+    /// the SPEC recommends actually resolves to today, and will fail the moment #2463 changes it.
+    #[test]
+    fn the_memo_scannable_profile_chain_does_not_resolve_its_did() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let alice = sim.bls(1_000_000);
+        let alice_p2 = StandardLayer::new(alice.pk);
+
+        // Block 1 — the DID exists.
+        let (create_did, did) =
+            Launcher::new(alice.coin.coin_id(), 1).create_simple_did(ctx, &alice_p2)?;
+        alice_p2.spend(ctx, alice.coin, create_did)?;
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+
+        // Block 2 — the DID creates an ORDINARY, EVEN-amount coin. Even keeps the singleton's
+        // one-odd-`CREATE_COIN` rule satisfied, which is what makes this composition legal.
+        let did_coin_id = did.coin.coin_id();
+        let ordinary = Coin::new(did_coin_id, alice.puzzle_hash, 2);
+        let hint = ctx.hint(alice.puzzle_hash)?;
+        let _child = did.update(
+            ctx,
+            &alice_p2,
+            Conditions::new().create_coin(alice.puzzle_hash, 2, hint),
+        )?;
+        // The DID recreates itself AND emits the 2-mojo coin, so the bundle needs those 2 mojos from
+        // elsewhere; Chia balances a bundle in aggregate, not per coin.
+        let funder = sim.bls(2);
+        StandardLayer::new(funder.pk).spend(ctx, funder.coin, Conditions::new())?;
+        sim.spend_coins(ctx.take(), &[alice.sk.clone(), funder.sk.clone()])?;
+
+        // Block 3 — the ordinary coin launches the store DIRECTLY, so the memos ARE written.
+        let launch = crate::mint_datastore_launch_with_kind(
+            ctx,
+            crate::StoreKind::DidProfile,
+            Launcher::new(ordinary.coin_id(), 1),
+            Bytes32::new([0x6d; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            alice.puzzle_hash,
+            vec![],
+        )?;
+        assert!(
+            launch.launcher_memos_written,
+            "the direct shape is the one that IS memo-scannable (test precondition)"
+        );
+        alice_p2.spend(ctx, ordinary, launch.parent_conditions.clone())?;
+        let coin_spends = ctx.take();
+        sim.spend_coins(coin_spends.clone(), std::slice::from_ref(&alice.sk))?;
+
+        let store_id = launch.datastore.info.launcher_id;
+        let chain = coin_spends
+            .iter()
+            .fold(MockChainSource::new(), |chain, spend| {
+                chain.with_spend(spend.coin.coin_id(), spend.clone())
+            });
+
+        assert_eq!(
+            resolve_owner_did(store_id, &chain)?,
+            None,
+            "KNOWN GAP #2463: the memo-scannable profile chain resolves to None, because the \
+             launcher's creator is an ordinary coin the walk cannot traverse without running \
+             chain-supplied CLVM"
+        );
+        Ok(())
+    }
+
     /// A [`ChainSource`] read ERROR surfaces as [`MerkleError::Chain`] — distinct from a fail-closed
     /// `None` (the chain could not be consulted, so ownership is unknown).
     #[test]

@@ -35,10 +35,18 @@ use crate::{MerkleError, MerkleResult};
 /// # Signing
 ///
 /// The returned spend is UNSIGNED. An [`Owner::Standard`] update requires exactly one `AGG_SIG_ME`
-/// over the owner's synthetic key; a custom/delegated inner owns its own requirement. Obtain the
-/// requirement via [`crate::required_signatures`].
+/// over the owner's synthetic key. Obtain the requirement via [`crate::required_signatures`].
 ///
 /// # Errors
+///
+/// Returns [`MerkleError::UnsupportedOwner`] for [`Owner::Custom`]: the metadata-update and
+/// recreation conditions are built inside this call, in a [`SpendContext`] the caller never sees, so
+/// a pre-built inner spend cannot contain them — the returned bundle would ignore `new_metadata`
+/// entirely, or melt the store by omitting the recreation (#2418).
+///
+/// (`Owner::Custom` is in practice unusable across this crate's whole public API: a
+/// [`chia_wallet_sdk::driver::Spend`] holds CLVM node pointers valid only in the allocator that built
+/// them, and no public operation exposes its [`SpendContext`] for the caller to build one in.)
 ///
 /// Returns [`MerkleError::Driver`] if the SDK fails to build the update conditions or the store
 /// spend, and [`MerkleError::NotDataStore`] if the freshly-built spend does not hydrate a child
@@ -48,6 +56,13 @@ pub fn update_root(
     owner: Owner,
     new_metadata: DigDataStoreMetadata,
 ) -> MerkleResult<MerkleCoinSpend> {
+    if matches!(owner, Owner::Custom(_)) {
+        return Err(MerkleError::UnsupportedOwner(
+            "an update's metadata and recreation conditions are built inside this call, so \
+             Owner::Custom cannot emit them — the bundle would ignore new_metadata or melt the store",
+        ));
+    }
+
     let mut ctx = SpendContext::new();
 
     let launcher_id = store.info.launcher_id;
@@ -255,6 +270,40 @@ mod tests {
         );
 
         sim.spend_coins(updated.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
+        Ok(())
+    }
+
+    /// REGRESSION (#2418): an update MUST refuse [`Owner::Custom`] rather than return a bundle
+    /// carrying neither the metadata update nor the recreation.
+    ///
+    /// `update_root` builds both conditions inside this call, in a [`SpendContext`] the caller never
+    /// sees, and `context::inner_spend` drops the conditions for a custom owner — so accepting one
+    /// returned `Ok` for a spend that melts the store by omission. That is #2418's signature verbatim,
+    /// on a second entry point.
+    #[test]
+    fn a_custom_owner_update_is_refused() -> anyhow::Result<()> {
+        use chia_wallet_sdk::driver::SpendWithConditions;
+
+        let mut sim = Simulator::new();
+        let (owner, store) = minted_store(&mut sim)?;
+
+        let mut ctx = SpendContext::new();
+        let prebuilt = StandardLayer::new(owner.pk).spend_with_conditions(&mut ctx, Conditions::new())?;
+
+        let result = update_root(
+            &store,
+            Owner::Custom(prebuilt),
+            DigDataStoreMetadata {
+                root_hash: Bytes32::new([0x77; 32]),
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            matches!(result, Err(MerkleError::UnsupportedOwner(_))),
+            "a custom-owner update must refuse, not return a bundle that updates nothing, got: \
+             {result:?}"
+        );
         Ok(())
     }
 
