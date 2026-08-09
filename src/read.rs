@@ -13,7 +13,8 @@
 //! spend. [`resolve_owner_did`] is the launcher-lineage WALK on top: it fetches the coin spends
 //! (`store_id` → its creator, and at most one hop beyond) through the injected CANONICAL
 //! [`dig_chainsource_interface::ChainSource`] read interface (a reference-DOWN pure leaf) and passes
-//! the creator spend to `did_ref_from_spend`, fail-closed to `Ok(None)` at every missing hop.
+//! the creator spend to `did_ref_from_spend`, fail-closed to `Ok(None)` at every missing hop — but
+//! to `Err(MerkleError::Chain)` when the source ANSWERS with something the coin did not commit to.
 //! dig-merkle itself opens no socket (INV-1) — the caller implements the chain read.
 
 use chia_puzzle_types::nft::NftIntermediateLauncherArgs;
@@ -37,8 +38,11 @@ pub struct DidRef {
     pub launcher_id: Bytes32,
 }
 
-/// Recognises whether a coin spend is a DID spend and, if so, returns its [`DidRef`]. Fail-closed:
-/// any spend that is not a parseable DID yields `Ok(None)` rather than an error.
+/// Recognises whether a coin spend is a DID spend and, if so, returns its [`DidRef`].
+///
+/// Fail-closed, and the two failures are DISTINCT: a genuine non-DID puzzle is `Ok(None)`, while a
+/// spend the coin did not commit to — a `puzzle_reveal` that does not hash to `coin.puzzle_hash` — is
+/// [`MerkleError::Chain`]. "Not a DID" is an answer; "the source lied about the puzzle" is not.
 ///
 /// This is the pure, network-free core of owner-DID discovery. Given the spend of a store launcher's
 /// PARENT coin, a `Some` result means that parent was a DID — i.e. the store is DID-owned — and names
@@ -60,9 +64,12 @@ pub struct DidRef {
 ///
 /// # Errors
 ///
-/// Returns [`MerkleError::Parse`] if the spend's puzzle/solution CLVM cannot be allocated, or
+/// Returns [`MerkleError::Parse`] if the spend's puzzle/solution CLVM cannot be allocated,
 /// [`MerkleError::Driver`] if the SDK's DID parser errors on a puzzle that structurally should have
-/// been a DID. A puzzle that simply is not a DID is `Ok(None)`, not an error.
+/// been a DID, and [`MerkleError::Chain`] if the `puzzle_reveal` does not hash to the spend's
+/// `coin.puzzle_hash` — a spend the coin never committed to, which is refused rather than parsed.
+///
+/// A puzzle that simply is not a DID is `Ok(None)`, not an error.
 pub fn did_ref_from_spend(spend: &CoinSpend) -> MerkleResult<Option<DidRef>> {
     let mut allocator = Allocator::new();
 
@@ -124,9 +131,18 @@ pub fn did_ref_from_spend(spend: &CoinSpend) -> MerkleResult<Option<DidRef>> {
 /// **The walk runs NO chain-supplied CLVM.** Every step parses or derives; none evaluates. An
 /// untrusted [`ChainSource`] therefore cannot spend the caller's CPU on a program of its choosing.
 ///
-/// It is **fail-closed to `Ok(None)`** at every missing/non-DID/unexpected step — a store that is
-/// simply not DID-owned is `Ok(None)`, never an error — and READ-ONLY (never signs, spends, or
-/// broadcasts). A [`ChainSource`] read error surfaces as [`MerkleError::Chain`].
+/// It is **fail-closed**, and READ-ONLY (never signs, spends, or broadcasts). Fail-closed splits two
+/// ways, and the split is the point:
+///
+/// - **`Ok(None)`** — the chain answered honestly and the answer is "no DID": a missing spend, a
+///   non-DID creator, or a creator the walk may not climb past. A store that is simply not DID-owned
+///   is never an error.
+/// - **[`MerkleError::Chain`]** — the source could not be consulted, or it ANSWERED with something the
+///   coin did not commit to: a read error, a spend whose `coin_id` is not the one requested, or a
+///   `puzzle_reveal` that does not hash to the coin's `puzzle_hash` (see [`did_ref_from_spend`]).
+///
+/// A hostile-source substitution is therefore distinguishable from a genuinely non-DID-owned store,
+/// rather than being flattened into the same `Ok(None)`.
 ///
 /// # Authoritative ONLY for a CONFIRMED on-chain spend (NC-9)
 ///
@@ -138,9 +154,12 @@ pub fn did_ref_from_spend(spend: &CoinSpend) -> MerkleResult<Option<DidRef>> {
 ///
 /// # Errors
 ///
-/// Returns [`MerkleError::Chain`] if a [`ChainSource`] read fails, or [`MerkleError::Parse`] /
-/// [`MerkleError::Driver`] if the creator spend fails to parse (propagated from
-/// [`did_ref_from_spend`]).
+/// Returns [`MerkleError::Chain`] if a [`ChainSource`] read fails, if a returned spend's `coin_id` is
+/// not the one requested, or if a returned `puzzle_reveal` does not hash to its coin's `puzzle_hash`;
+/// and [`MerkleError::Parse`] / [`MerkleError::Driver`] if the creator spend fails to parse (both
+/// propagated from [`did_ref_from_spend`]).
+///
+/// A store that is not DID-owned is `Ok(None)`, never an error.
 pub fn resolve_owner_did<C: ChainSource>(
     store_id: Bytes32,
     chain: &C,

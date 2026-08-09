@@ -226,7 +226,7 @@ choose one.** Neither shape delivers both, and the choice is the caller's:
   creator is an ordinary coin, which is neither a DID nor the recognised intermediate launcher, so
   §3.7 returns `Ok(None)` and the store reports as not-DID-owned. This chain is legal on chain
   because the one-odd-`CREATE_COIN` restriction binds the *singleton's* inner puzzle, not an
-  ordinary coin. Tracked as **#2463**.
+  ordinary coin (**#2463**).
 
 §3.7 MUST NOT be extended over that ordinary hop by inspection alone: an ordinary coin's outputs are
 knowable only by EXECUTING its puzzle — the chain-supplied CLVM the walk exists to never run — and
@@ -296,8 +296,12 @@ delegation set from a coin/puzzle without spending. No signing.
 
 `did_ref_from_spend(spend) -> MerkleResult<Option<DidRef>>` is the pure, network-free core of
 owner-DID discovery (§3.7): it recognises whether a coin spend is a DID spend (via the SDK's
-`Did::parse`, INV-4) and, if so, returns its `DidRef { launcher_id }`. Fail-closed — a spend that is
-not a parseable DID yields `Ok(None)`. No signing, no chain access.
+`Did::parse`, INV-4) and, if so, returns its `DidRef { launcher_id }`. No signing, no chain access.
+
+Fail-closed, and the two failures MUST stay DISTINCT: a genuine non-DID puzzle yields `Ok(None)`,
+while a spend the coin did not commit to — a `puzzle_reveal` that does not hash to `coin.puzzle_hash`
+— yields `Err(MerkleError::Chain)`. "Not a DID" is an answer; "the source lied about the puzzle" is
+not.
 
 ### 3.7 resolve_owner_did
 
@@ -323,7 +327,8 @@ Every spend the walk consumes MUST be bound to the coin it claims to be, in BOTH
 spend's `coin.coin_id()` MUST equal the id that was asked for, AND its `puzzle_reveal` MUST hash to
 `coin.puzzle_hash`. A coin id is derived from the coin's own fields, so the first binding alone is
 satisfied by any reveal whatsoever; without the second, a source that returns a genuine coin paired
-with a forged reveal can have a DID attributed to a store that has none.
+with a forged reveal can have a DID attributed to a store that has none. A violation of EITHER binding
+MUST yield `Err(MerkleError::Chain)`, never `Ok(None)`.
 
 **The walk is BOUNDED at two creator hops, and the second MUST be earned.** A singleton parent
 interposes an intermediate coin (§3.1a), so the DID sits two hops above the launcher; without step 5
@@ -350,10 +355,15 @@ execute. Second, shape is a looser bind: it admits ANY puzzle that happens to em
 not just the intermediate launcher the walk means to traverse.
 
 Anything else, and any parse failure, stops the walk at `Ok(None)`. A DID three or more hops above the
-launcher is NOT reported.
+launcher is NOT reported. This is the honest-answer path; it is distinct from a source that ANSWERS
+with something the coin did not commit to, which is `Err(MerkleError::Chain)` (above).
 
-It is **fail-closed to `Ok(None)`** at every missing/non-DID/unexpected step (never an error for "not
-DID-owned") and **READ-ONLY** — it never signs, spends, or broadcasts. All chain access is delegated
+It is **fail-closed** and **READ-ONLY** — it never signs, spends, or broadcasts. Fail-closed splits
+two ways, and the split MUST be preserved: a chain that answers honestly with "no DID" — a missing
+spend, a non-DID creator, or a creator the walk may not climb past — is `Ok(None)`, never an error for
+"not DID-owned"; a source that cannot be consulted, or that answers with a spend the coin did not
+commit to (a wrong `coin_id`, or a `puzzle_reveal` that does not hash to `coin.puzzle_hash`), is
+`Err(MerkleError::Chain)`. All chain access is delegated
 to the caller-supplied `ChainSource`, the CANONICAL `dig_chainsource_interface::ChainSource` read
 interface — a reference-DOWN pure leaf crate below dig-merkle, NOT a local trait — with the single
 synchronous method `coin_spend(coin_id: Bytes32) -> MerkleResult<Option<CoinSpend>>` (INV-1: the
@@ -405,7 +415,8 @@ to a READ: `resolve_owner_did` walks the launcher lineage via the injected `Chai
 (`coin_spend(store_id)` → its `parent_coin_info` → `coin_spend(parent)`, plus at most one further hop
 through an intermediate-launcher coin) and recognises a DID creator with `did_ref_from_spend`. Any
 missing spend, or a non-DID creator the walk may not climb past, yields `Ok(None)` — never a
-fabricated result and never an error for "not DID-owned".
+fabricated result and never an error for "not DID-owned". A source that ANSWERS with a spend the coin
+did not commit to yields `Err(MerkleError::Chain)` instead (below).
 
 **Store-id binding is MANDATORY per hop (NC-9).** The injected `ChainSource` is trusted only to
 return CONFIRMED spends, never to return the RIGHT coin — a hostile or buggy source (the public
@@ -416,6 +427,10 @@ and fails CLOSED on any mismatch — it MUST NOT return a `Some(DidRef)` it cann
   (a DIG store id IS its launcher coin id). A mismatch is rejected with `Err(MerkleError::Chain)`.
 - EVERY creator spend returned for a `coin_id` MUST satisfy `spend.coin.coin_id() == coin_id`,
   including the second hop's. A mismatch is rejected with `Err(MerkleError::Chain)`.
+- EVERY spend the walk parses MUST satisfy `tree_hash(puzzle_reveal) == spend.coin.puzzle_hash`. A
+  coin id is derived from the coin's own fields, so the two bindings above are satisfied by ANY reveal;
+  without this one a source can pair a genuine coin with a real DID's reveal and have that DID
+  attributed to a store with no DID link. A mismatch is rejected with `Err(MerkleError::Chain)`.
 A substituted answer is deliberately surfaced as `Err(Chain)`, not `Ok(None)`, so a hostile-source
 substitution is distinguishable from a genuinely non-DID-owned store.
 
@@ -432,8 +447,10 @@ substitution is distinguishable from a genuinely non-DID-owned store.
 | `MissingLineage` | hydration lacks the required lineage proof (fail-closed) |
 | `MissingHint` | a parsed coin lacks the required hint memo (fail-closed) |
 | `Permission(String)` | a delegated-puzzle op lacks its required authority (e.g. writer→admin) |
-| `Chain(String)` | a chain-level precondition is violated (e.g. launcher mismatch) |
+| `Chain(String)` | a chain-level precondition is violated (e.g. launcher mismatch, an unbound spend) |
+| `UnsupportedOwner(&'static str)` | the operation builds the conditions its spend must emit, so `Owner::Custom` cannot authorize it (§3.1, §3.2, §3.5) |
 | `EmptyCoins` | an operation was given an empty coin set |
+| `InvalidSize(String)` | a size-bucket exponent or byte length falls outside the `0..=10` ladder (§2) |
 
 ## 7. Security properties
 

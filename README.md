@@ -77,7 +77,7 @@ designed surface; each lands in its own unit.
 | `mint::mint_datastore(parent_coin, owner, root_hash, label, description, size_proof, program_hash, size_bucket, owner_ph, delegated, fee)` | **shipped** — launch a new DataLayer store anchoring a root, byte-identical to on-chain stores | owner's `AGG_SIG_ME` |
 | `size::SizeBucket` (`from_exponent`/`for_byte_len`/`exponent`/`megabytes`/`byte_len`) | **shipped** — the canonical `.dig` size-bucket ladder (`k ∈ 0..=10` ↔ `2^k MB`, 1 MB..1 GB); CLVM key `sz`, replaces the exact-byte `"b"` | — |
 | `digstore_owner_hint(owner_ph)` / `DATASTORE_LAUNCHER_HINT` / `DIGSTORE_OWNER_HINT_DOMAIN` | **shipped** — the owner-discovery hint (SPEC §9) | — |
-| `read::did_ref_from_spend(&coin_spend)` | **shipped** — recognise a DID coin spend, returning its `DidRef { launcher_id }` (fail-closed to `None`) | none |
+| `read::did_ref_from_spend(&coin_spend)` | **shipped** — recognise a DID coin spend, returning its `DidRef { launcher_id }` (a non-DID puzzle is `None`; a reveal the coin did not commit to is `Err(Chain)`) | none |
 | `read::resolve_owner_did(store_id, &chain)` | recover the DID that owns a store via a `ChainSource` lineage walk (SPEC §3.7) — *pending `dig-chainsource-interface` crates.io publish* | none |
 | `update::update_root(store, owner, new_metadata)` | recreate the coin with a new merkle root | owner or writer/admin `AGG_SIG_ME` |
 | `delegation::set_delegated_puzzles(store, owner, set)` | grant/revoke admin/writer/oracle authority (admin-only) | owner or admin `AGG_SIG_ME` |

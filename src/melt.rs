@@ -35,8 +35,7 @@ use crate::{MerkleError, MerkleResult};
 /// [`chia_wallet_sdk::driver::Spend`] holds CLVM node pointers valid only in the allocator that built
 /// them, and no public operation exposes its [`SpendContext`] for the caller to build one in.)
 ///
-/// Returns [`MerkleError::Driver`](crate::MerkleError::Driver) if the SDK fails to build the melt
-/// spend.
+/// Returns [`MerkleError::Driver`] if the SDK fails to build the melt spend.
 pub fn melt(
     store: &DataStore<DigDataStoreMetadata>,
     owner: Owner,

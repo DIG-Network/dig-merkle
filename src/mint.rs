@@ -346,6 +346,11 @@ pub fn mint_datastore_launch_with_kind(
         owner_puzzle_hash.into(),
         delegated_puzzles,
     )?;
+    // UNEXERCISED BY CONSTRUCTION on chia-wallet-sdk 0.34: the minted amount is always the
+    // `singleton_amount` already checked above, so no input reaches this check first and deleting it
+    // leaves every test green. It is kept deliberately, against a future SDK builder field that steers
+    // the minted amount independently — the failure it guards (a permanently frozen store) is
+    // irreversible, and this is the last point at which it is still catchable.
     assert_minted_singleton_amount_is_odd(datastore.coin.amount)?;
 
     // Override the launcher CREATE_COIN memos to the two-memo owner-discovery hint (SPEC §9). This is
@@ -411,9 +416,10 @@ fn assert_launcher_is_legal(launcher_coin: Coin, singleton_amount: u64) -> Merkl
 ///
 /// Called twice on purpose. Once on the caller's declared [`Launcher::singleton_amount`], where it can
 /// name the mistake before anything is built; and once on `datastore.coin.amount` — the amount the SDK
-/// ACTUALLY minted — after the launch is constructed. The second call is the class-level guard: it
-/// holds however the `Launcher` was configured, so a future SDK builder field that steers the minted
-/// amount cannot silently reopen the frozen-store hole.
+/// ACTUALLY minted — after the launch is constructed. On the current SDK those two values are always
+/// equal, so the second call is unreachable-in-practice rather than independently verified; it exists
+/// so a future builder field that steers the minted amount cannot silently reopen the frozen-store
+/// hole.
 fn assert_minted_singleton_amount_is_odd(singleton_amount: u64) -> MerkleResult<()> {
     if singleton_amount % 2 == 0 {
         return Err(MerkleError::Chain(format!(

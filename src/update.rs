@@ -41,8 +41,10 @@ use crate::{MerkleError, MerkleResult};
 ///
 /// Returns [`MerkleError::UnsupportedOwner`] for [`Owner::Custom`]: the metadata-update and
 /// recreation conditions are built inside this call, in a [`SpendContext`] the caller never sees, so
-/// a pre-built inner spend cannot contain them — the returned bundle would ignore `new_metadata`
-/// entirely, or melt the store by omitting the recreation (#2418).
+/// a pre-built inner spend cannot contain them. What the caller got back was never an update: an
+/// ordinary pre-built spend yields [`MerkleError::Driver`] from child hydration (the recreation it
+/// never emitted), and a pre-built spend that emits its OWN recreation returns `Ok` for a bundle that
+/// ignored `new_metadata` entirely (#2418).
 ///
 /// (`Owner::Custom` is in practice unusable across this crate's whole public API: a
 /// [`chia_wallet_sdk::driver::Spend`] holds CLVM node pointers valid only in the allocator that built
