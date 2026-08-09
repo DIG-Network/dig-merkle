@@ -323,8 +323,10 @@ pub fn mint_datastore_launch_with_kind(
 /// - **Direct** — the conditions create the launcher coin themselves. A puzzle-hash + amount match on
 ///   the already-parsed [`Conditions`] settles it (O(n), no CLVM re-run).
 /// - **Via an intermediate** — the conditions create an even-amount intermediate coin whose OWN
-///   staged spend creates the launcher. Verified by running that staged spend and checking the coin
-///   it creates IS `launcher_coin`, so a mismatched or absent intermediate cannot pass.
+///   staged spend creates the launcher. The intermediate is matched by puzzle hash and amount only
+///   (the parent coin's id is not an input to this function, so a caller that names the wrong parent
+///   when constructing the `IntermediateLauncher` is not detected here); the launcher coin is verified
+///   by its full coin id via `spend_creates`.
 fn assert_launch_reaches_the_launcher(
     ctx: &mut SpendContext,
     conditions: &Conditions,

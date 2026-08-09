@@ -172,8 +172,9 @@ otherwise:
 2. **Via an intermediate — a SINGLETON parent** (a DID, another DataStore, a vault singleton).
    `IntermediateLauncher::new(parent_coin.coin_id(), 0, 1).create(ctx)?`. The `parent_conditions`
    contain a `CREATE_COIN` for a ZERO-amount intermediate coin, whose own (already staged) spend
-   creates the 1-mojo launcher. Verified by RUNNING that staged spend and checking the coin it
-   creates IS `launcher.coin()`.
+   creates the 1-mojo launcher. The intermediate coin is matched by puzzle hash and amount; the
+   launcher coin is verified by full coin id. The parent coin's id is not an input, so a caller
+   that names the wrong parent when constructing `IntermediateLauncher` is not detected here.
 
 A singleton's inner puzzle MAY emit exactly ONE odd-amount `CREATE_COIN` — its own successor — so
 shape 1 from a singleton parent builds cleanly and is REJECTED on chain (a CLVM raise). Shape 2 is
