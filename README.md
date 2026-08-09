@@ -119,9 +119,14 @@ mojo from another spend; Chia balances a bundle in aggregate, not per coin.
 
 The two-memo owner-discovery hint lives on the launcher `CREATE_COIN`, which an intermediate launch
 emits from its own fixed puzzle — so a store launched this way carries **no launcher memos** and is
-not found by a launcher-memo scan. It is discovered by `resolve_owner_did` instead (below). A caller
-that needs both the memos and a DID root interposes its own ordinary coin, created at an even amount
-by the DID, and launches directly from that.
+not found by a launcher-memo scan. The `kind` discriminator rides on those same memos, so it too is
+accepted but not written on this path — the launch reports `launcher_memos_written == false` so a
+caller can see it. Such a store is discovered by `resolve_owner_did` instead (below).
+
+**Profile stores must be memo-scannable, so the intermediate is not the profile-launch shape.** The
+supported profile chain is `DID coin -> ordinary EVEN-amount coin -> launcher (memos intact) ->
+store`: the DID creates an ordinary even-amount coin and that coin launches directly, which does
+write the memos. The odd-coin restriction binds the *singleton's* inner puzzle, not an ordinary coin.
 
 `mint_datastore_with_kind` (the all-in-one wrapper) accepts only `Owner::Standard` and rejects
 `Owner::Custom` with `MerkleError::UnsupportedOwner` — use the composable API above for DID-rooted

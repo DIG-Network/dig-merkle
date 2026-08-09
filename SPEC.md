@@ -184,8 +184,15 @@ therefore MANDATORY for a singleton parent, and shape 1 MUST NOT be used with on
 on the launcher `CREATE_COIN`, which under shape 2 is emitted by the intermediate coin's own fixed
 puzzle; dig-merkle cannot write memos onto it. Such a store is NOT discoverable by a launcher-memo
 scan (§9) and — this includes its `StoreKind` discriminator — is discovered by the §3.7 lineage walk
-instead. A caller needing BOTH the memos and a singleton root MUST interpose its own ordinary coin,
-created at an even amount by the singleton, and launch from it with shape 1.
+instead. The `kind` argument is therefore ACCEPTED BUT NOT HONOURED under shape 2; the launch reports
+this as `DatastoreLaunch.launcher_memos_written == false`, which a caller MUST check when
+memo-scannability matters.
+
+**A PROFILE store MUST be memo-scannable, so shape 2 is NOT the profile-launch shape.** The supported
+profile chain is `DID coin -> ordinary EVEN-amount coin -> launcher (memos intact) -> store`: the DID
+singleton creates an ordinary coin at an even amount, and THAT coin launches with shape 1, which does
+write both memos. This is legal because the one-odd-`CREATE_COIN` restriction binds the *singleton's*
+inner puzzle, not an ordinary coin. Shape 2 is for launches where memo-scannability is not required.
 
 **Bundle balance.** Under shape 2 a zero-amount coin creates a 1-mojo launcher, so the surrounding
 spend bundle MUST supply that mojo from another spend. Chia balances a bundle in aggregate, not per

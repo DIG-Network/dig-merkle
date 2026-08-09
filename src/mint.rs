@@ -153,6 +153,9 @@ pub fn mint_datastore_with_kind(
     let DatastoreLaunch {
         parent_conditions: launch_conditions,
         datastore,
+        // This path always launches directly from an ordinary coin, so the memos are always written;
+        // the flag exists for callers that compose their own launcher shape.
+        ..
     } = mint_datastore_launch_with_kind(
         &mut ctx,
         kind,
@@ -212,6 +215,20 @@ pub struct DatastoreLaunch {
 
     /// The eve DataStore as it will exist once the launch confirms.
     pub datastore: DataStore<DigDataStoreMetadata>,
+
+    /// Whether this launch actually wrote the launcher memos — the two-memo owner-discovery hint AND
+    /// the [`StoreKind`] discriminator (SPEC §9).
+    ///
+    /// `true` for a DIRECT launch, where the launcher `CREATE_COIN` is one of `parent_conditions` and
+    /// can therefore be rewritten. `false` for an INTERMEDIATE launch, where that condition is
+    /// emitted by the intermediate coin's own fixed `NftIntermediateLauncherArgs` puzzle, which this
+    /// crate does not author and cannot add memos to — so the `kind` argument is silently unrecorded
+    /// on chain and the store is invisible to a launcher-memo scan.
+    ///
+    /// This is measured, not inferred: it reports whether the rewrite fired, so it cannot drift from
+    /// what the bundle actually contains. A caller whose store MUST be memo-scannable — every profile
+    /// store — checks this field and uses the direct shape.
+    pub launcher_memos_written: bool,
 }
 
 /// Builds a DataLayer launch into the CALLER's [`SpendContext`], returning the conditions the
@@ -246,15 +263,24 @@ pub struct DatastoreLaunch {
 /// Either way the launcher's `CREATE_COIN` chain is verified before returning (see the errors below),
 /// so a shape that cannot launch is refused rather than handed back as a success.
 ///
-/// # The owner-discovery memos need a DIRECT launcher (SPEC §3.7)
+/// # The owner-discovery memos need a DIRECT launcher (SPEC §3.7), and `kind` rides on them
 ///
 /// The two-memo owner-discovery hint (SPEC §9) lives on the launcher `CREATE_COIN`, so it can only be
 /// written when THIS launch emits that condition — i.e. the direct shape. An intermediate-launcher
-/// launch has its launcher `CREATE_COIN` emitted by the intermediate coin's own fixed puzzle, which
-/// carries no memos; such a store is NOT discoverable by a launcher-memo scan and is instead
-/// discovered by the lineage walk in [`crate::resolve_owner_did`], which traverses the intermediate
-/// hop. A caller that needs BOTH the memos and a singleton root interposes its OWN ordinary coin
-/// (created at an even amount by the singleton) and launches directly from it.
+/// launch has its launcher `CREATE_COIN` emitted by the intermediate coin's own fixed
+/// `NftIntermediateLauncherArgs` puzzle, which this crate does not author and cannot add memos to.
+///
+/// So on the intermediate path BOTH memos are absent: the owner hint AND the `kind` discriminator.
+/// **`kind` is accepted but not honoured there** — the launch still succeeds, and reports
+/// [`DatastoreLaunch::launcher_memos_written`] `== false` so the caller can see it. Such a store is
+/// invisible to a launcher-memo scan and is discovered only by the lineage walk in
+/// [`crate::resolve_owner_did`], which traverses the intermediate hop.
+///
+/// **A PROFILE store must be memo-scannable, so the intermediate is NOT the profile-launch shape.**
+/// The supported profile chain is `DID coin -> ordinary EVEN-amount coin -> launcher (memos intact)
+/// -> store`: the singleton creates an ordinary even-amount coin, and THAT coin launches directly.
+/// This is legal because the one-odd-`CREATE_COIN` restriction binds the *singleton's* inner puzzle,
+/// not an ordinary coin. Use the intermediate shape only where memo-scannability is not required.
 ///
 /// # Errors
 ///
@@ -298,7 +324,7 @@ pub fn mint_datastore_launch_with_kind(
     // Override the launcher CREATE_COIN memos to the two-memo owner-discovery hint (SPEC §9). This is
     // the byte-identity requirement: the raw SDK mint emits only a single default hint, which matches
     // no store already on chain.
-    let parent_conditions =
+    let (parent_conditions, launcher_memos_written) =
         override_launcher_hint(ctx, launch_conditions, owner_puzzle_hash, kind)?;
 
     #[cfg(test)]
@@ -309,6 +335,7 @@ pub fn mint_datastore_launch_with_kind(
     Ok(DatastoreLaunch {
         parent_conditions,
         datastore,
+        launcher_memos_written,
     })
 }
 
@@ -412,12 +439,19 @@ fn spend_creates(
 /// is owner-discoverable and byte-identical on chain (SPEC §9). The second memo is the kind
 /// discriminator — [`StoreKind::File`] keeps the historical `DATASTORE_LAUNCHER_HINT` bytes. Every
 /// other condition passes through unchanged.
+///
+/// Returns the rewritten conditions and whether a launcher `CREATE_COIN` was actually found to
+/// rewrite. It is absent whenever the launcher is created by an intermediate coin rather than by the
+/// parent, and in that case `kind` and the owner hint reach no condition at all — the caller reports
+/// that fact as [`DatastoreLaunch::launcher_memos_written`] rather than claiming a hint it never
+/// wrote.
 fn override_launcher_hint(
     ctx: &mut SpendContext,
     conditions: Conditions,
     owner_puzzle_hash: Bytes32,
     kind: StoreKind,
-) -> MerkleResult<Conditions> {
+) -> MerkleResult<(Conditions, bool)> {
+    let mut memos_written = false;
     let mut rewritten = Conditions::new();
     for condition in conditions {
         match condition {
@@ -433,11 +467,12 @@ fn override_launcher_hint(
                     amount: create_coin.amount,
                     memos,
                 }));
+                memos_written = true;
             }
             other => rewritten = rewritten.with(other),
         }
     }
-    Ok(rewritten)
+    Ok((rewritten, memos_written))
 }
 
 #[cfg(test)]
@@ -732,13 +767,17 @@ mod tests {
                 vec![],
             )
             .expect("reference mint builds");
-        let launch_conditions = override_launcher_hint(
+        let (launch_conditions, memos_written) = override_launcher_hint(
             &mut ctx,
             launch_conditions,
             owner_puzzle_hash,
             StoreKind::File,
         )
         .expect("reference hint override");
+        assert!(
+            memos_written,
+            "the reference bundle launches directly, so the memos must have been written"
+        );
 
         let reserved = fee + 1;
         let owner_conditions = if parent_coin.amount > reserved {
@@ -1188,16 +1227,141 @@ mod tests {
         Ok(())
     }
 
+    /// The memos on the launcher `CREATE_COIN` across `coin_spends`, or `None` when that condition
+    /// carries none. Unlike [`launcher_memos`] this does not require memos to be present — it exists
+    /// precisely to pin the shape where they are absent.
+    fn launcher_memos_if_any(coin_spends: &[crate::types::CoinSpend]) -> Option<Vec<Bytes32>> {
+        for spend in coin_spends {
+            let mut ctx = SpendContext::new();
+            let puzzle = ctx.alloc(&spend.puzzle_reveal).expect("alloc puzzle");
+            let solution = ctx.alloc(&spend.solution).expect("alloc solution");
+            let output = ctx.run(puzzle, solution).expect("run puzzle");
+            let conditions = Vec::<Condition>::from_clvm(&*ctx, output).expect("parse conditions");
+            for condition in conditions {
+                if let Condition::CreateCoin(cc) = condition {
+                    if cc.puzzle_hash == SINGLETON_LAUNCHER_HASH {
+                        return match cc.memos {
+                            Memos::Some(ptr) => Some(
+                                Vec::<Bytes32>::from_clvm(&*ctx, ptr)
+                                    .expect("parse launcher memos"),
+                            ),
+                            Memos::None => None,
+                        };
+                    }
+                }
+            }
+        }
+        panic!("no launcher CREATE_COIN found");
+    }
+
+    /// LOAD-BEARING (#2418): the intermediate shape CANNOT carry the launcher memos, so `kind` is
+    /// accepted-but-unhonoured there — and the return value says so.
+    ///
+    /// The launcher `CREATE_COIN` on that path is emitted by the intermediate coin's own fixed
+    /// `NftIntermediateLauncherArgs` puzzle, which this crate does not author, so
+    /// [`override_launcher_hint`] finds nothing to rewrite. This asserts the limitation rather than
+    /// describing it in prose, and pairs it with the DIRECT shape as a truthful control: the ONLY
+    /// thing that varies between the two halves is the launcher shape, so a rewrite that silently
+    /// stopped firing on the direct path would fail here too.
+    ///
+    /// It is also why a profile store — which MUST be memo-scannable — launches from an ordinary
+    /// even-amount coin created by the DID, never through an intermediate.
+    #[test]
+    fn the_intermediate_shape_writes_no_launcher_memos_and_reports_it() -> anyhow::Result<()> {
+        use chia_wallet_sdk::driver::IntermediateLauncher;
+
+        let (_owner_pk, owner_ph) = seeded_owner();
+        let parent_id = Bytes32::new([0x71; 32]);
+
+        // Intermediate shape: the parent's conditions create the even-amount intermediate, which in
+        // its own staged spend creates the launcher.
+        let ctx = &mut SpendContext::new();
+        let launcher = IntermediateLauncher::new(parent_id, 0, 1).create(ctx)?;
+        let intermediate_launch = mint_datastore_launch_with_kind(
+            ctx,
+            StoreKind::DidProfile,
+            launcher,
+            Bytes32::new([0x6d; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            vec![],
+        )?;
+        assert!(
+            !intermediate_launch.launcher_memos_written,
+            "the intermediate path cannot write the launcher memos, and must not claim it did"
+        );
+        assert_eq!(
+            launcher_memos_if_any(&ctx.take()),
+            None,
+            "the launcher CREATE_COIN emitted by the fixed intermediate puzzle carries no memos, so \
+             neither the owner hint nor the StoreKind discriminator reaches the chain"
+        );
+
+        // Control — the SAME call, varying only the launcher shape, does write both memos.
+        let ctx = &mut SpendContext::new();
+        let direct_launch = mint_datastore_launch_with_kind(
+            ctx,
+            StoreKind::DidProfile,
+            Launcher::new(parent_id, 1),
+            Bytes32::new([0x6d; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            vec![],
+        )?;
+        assert!(
+            direct_launch.launcher_memos_written,
+            "the direct shape emits the launcher CREATE_COIN itself, so the rewrite must fire"
+        );
+        // The direct launcher CREATE_COIN is a PARENT condition rather than a staged spend, so read
+        // it there — and confirm it really carries the two-memo hint, not merely some memos.
+        let memos = direct_launch
+            .parent_conditions
+            .iter()
+            .find_map(|condition| match condition {
+                Condition::CreateCoin(cc) if cc.puzzle_hash == SINGLETON_LAUNCHER_HASH => {
+                    Some(cc.memos)
+                }
+                _ => None,
+            })
+            .expect("the direct shape emits the launcher CREATE_COIN itself");
+        let Memos::Some(ptr) = memos else {
+            panic!("the direct shape must carry the owner-discovery memos");
+        };
+        assert_eq!(
+            Vec::<Bytes32>::from_clvm(&**ctx, ptr).expect("parse launcher memos"),
+            vec![
+                digstore_owner_hint(owner_ph),
+                launcher_hint_for(StoreKind::DidProfile)
+            ],
+            "the direct shape writes BOTH the owner hint and the StoreKind discriminator"
+        );
+        Ok(())
+    }
+
     /// The NEGATIVE CONTROL for the test above, and the reason the intermediate is not ceremony:
     /// the SAME launch with the launcher parented DIRECTLY to the singleton is REJECTED by the
     /// simulator. A Chia singleton's inner puzzle may emit exactly ONE odd-amount `CREATE_COIN` — its
     /// own successor — so the 1-mojo launcher is a second odd output and the bundle raises.
     ///
-    /// Everything except the launcher shape is identical to the accepted case, so a pass here can
-    /// only mean the direct shape was rejected for the odd-coin rule.
+    /// Everything except the launcher shape is identical to the accepted case, AND the assertion
+    /// pins the specific CLVM raise — the two together are what make this discriminating. Neither
+    /// alone is: a bare `is_err()` also passes with the funder removed, with the signing key removed,
+    /// and even on the LEGAL intermediate shape, so it would report "something went wrong" rather
+    /// than "the chain rejects this shape".
     #[test]
     fn a_launcher_parented_directly_to_a_singleton_is_rejected_on_chain() -> anyhow::Result<()> {
+        use chia_wallet_sdk::clvmr::error::EvalErr;
         use chia_wallet_sdk::driver::StandardLayer;
+        use chia_wallet_sdk::signer::SignerError;
+        use chia_wallet_sdk::test::SimulatorError;
 
         let mut sim = Simulator::new();
         let ctx = &mut SpendContext::new();
@@ -1221,11 +1385,23 @@ mod tests {
         StandardLayer::new(funder.pk).spend(ctx, funder.coin, Conditions::new())?;
 
         let result = sim.spend_coins(ctx.take(), &[alice.sk.clone(), funder.sk.clone()]);
-        eprintln!("REJECTION: {result:?}");
+
+        // Pin the SPECIFIC failure, never a bare `is_err()`. A generic error assertion passes on the
+        // very compositions this control exists to distinguish itself from — an unfunded bundle
+        // (`Validation`), an unsigned one (`MissingKey`), or even the LEGAL intermediate shape — so
+        // it would prove "something went wrong", not "the chain rejects this shape".
+        //
+        // The singleton's inner puzzle enforces the one-odd-`CREATE_COIN` rule with a CLVM `(x)`, so
+        // the intended rejection surfaces as a raise from the puzzle itself. That is the narrowest
+        // pin available: the simulator reports the raise, not which of the puzzle's assertions
+        // raised.
         assert!(
-            result.is_err(),
-            "a 1-mojo launcher emitted directly by a singleton is a second odd CREATE_COIN and \
-             must be rejected on chain"
+            matches!(
+                result,
+                Err(SimulatorError::Signer(SignerError::Eval(EvalErr::Raise(_))))
+            ),
+            "a 1-mojo launcher emitted directly by a singleton is a second odd CREATE_COIN and must \
+             be rejected by a CLVM raise from the singleton puzzle, but got: {result:?}"
         );
         Ok(())
     }
