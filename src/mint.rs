@@ -33,8 +33,7 @@ use crate::{MerkleError, MerkleResult};
 /// Sourced from the SDK constant [`crate::read`] also reads, so the mint's legality guard and the
 /// read recogniser can never compare against two different definitions of one canonical value. (The
 /// ecosystem-wide move of such constants into `dig-constants` is tracked as #2464.)
-const SINGLETON_LAUNCHER_PUZZLE_HASH: Bytes32 =
-    Bytes32::new(SINGLETON_LAUNCHER_HASH);
+const SINGLETON_LAUNCHER_PUZZLE_HASH: Bytes32 = Bytes32::new(SINGLETON_LAUNCHER_HASH);
 
 /// Builds the unsigned spends that mint a new DataLayer store singleton anchoring `root_hash`.
 ///
@@ -1355,15 +1354,16 @@ mod tests {
 
         // An EVEN-amount launcher — the transposition `Launcher::new(parent, 0)` /
         // `IntermediateLauncher::new(parent, 0, 1)` produces, here at 2 mojos so the bundle balances.
-        let (launch_conditions, datastore) = Launcher::new(owner.coin.coin_id(), 2).mint_datastore(
-            ctx,
-            DigDataStoreMetadata {
-                root_hash: Bytes32::new([0x5a; 32]),
-                ..Default::default()
-            },
-            owner_ph.into(),
-            vec![],
-        )?;
+        let (launch_conditions, datastore) = Launcher::new(owner.coin.coin_id(), 2)
+            .mint_datastore(
+                ctx,
+                DigDataStoreMetadata {
+                    root_hash: Bytes32::new([0x5a; 32]),
+                    ..Default::default()
+                },
+                owner_ph.into(),
+                vec![],
+            )?;
         StandardLayer::new(owner.pk).spend(ctx, owner.coin, launch_conditions)?;
 
         sim.spend_coins(ctx.take(), std::slice::from_ref(&owner.sk))

@@ -761,11 +761,17 @@ mod tests {
         let alice = sim.bls(1_000_000);
         let alice_p2 = StandardLayer::new(alice.pk);
 
+        // Every block's spends are kept, because the chain source must serve the WHOLE lineage —
+        // the walk stopping early must be the resolver's doing, not a source that forgot the DID.
+        let mut settled: Vec<CoinSpend> = Vec::new();
+
         // Block 1 — the DID exists.
         let (create_did, did) =
             Launcher::new(alice.coin.coin_id(), 1).create_simple_did(ctx, &alice_p2)?;
         alice_p2.spend(ctx, alice.coin, create_did)?;
-        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+        let block = ctx.take();
+        sim.spend_coins(block.clone(), std::slice::from_ref(&alice.sk))?;
+        settled.extend(block);
 
         // Block 2 — the DID creates an ORDINARY, EVEN-amount coin. Even keeps the singleton's
         // one-odd-`CREATE_COIN` rule satisfied, which is what makes this composition legal.
@@ -781,7 +787,9 @@ mod tests {
         // elsewhere; Chia balances a bundle in aggregate, not per coin.
         let funder = sim.bls(2);
         StandardLayer::new(funder.pk).spend(ctx, funder.coin, Conditions::new())?;
-        sim.spend_coins(ctx.take(), &[alice.sk.clone(), funder.sk.clone()])?;
+        let block = ctx.take();
+        sim.spend_coins(block.clone(), &[alice.sk.clone(), funder.sk.clone()])?;
+        settled.extend(block);
 
         // Block 3 — the ordinary coin launches the store DIRECTLY, so the memos ARE written.
         let launch = crate::mint_datastore_launch_with_kind(
@@ -802,15 +810,49 @@ mod tests {
             "the direct shape is the one that IS memo-scannable (test precondition)"
         );
         alice_p2.spend(ctx, ordinary, launch.parent_conditions.clone())?;
-        let coin_spends = ctx.take();
-        sim.spend_coins(coin_spends.clone(), std::slice::from_ref(&alice.sk))?;
+        let block = ctx.take();
+        sim.spend_coins(block.clone(), std::slice::from_ref(&alice.sk))?;
+        settled.extend(block);
 
         let store_id = launch.datastore.info.launcher_id;
-        let chain = coin_spends
-            .iter()
-            .fold(MockChainSource::new(), |chain, spend| {
-                chain.with_spend(spend.coin.coin_id(), spend.clone())
-            });
+        let chain = settled.iter().fold(MockChainSource::new(), |chain, spend| {
+            chain.with_spend(spend.coin.coin_id(), spend.clone())
+        });
+
+        // The `None` must be caused by the ORDINARY hop, not by a fixture that lost its DID: the
+        // launcher's creator really is the ordinary coin, that coin's creator really is the DID coin,
+        // and the source really can serve every spend in between. Without these the assertion below
+        // would also pass on a chain that simply had no DID in it.
+        let launcher_spend = chain
+            .coin_spend(store_id)?
+            .expect("the source serves the launcher spend");
+        assert_eq!(
+            launcher_spend.coin.parent_coin_info,
+            ordinary.coin_id(),
+            "the launcher's creator is the ordinary even-amount coin"
+        );
+        let ordinary_spend = chain
+            .coin_spend(ordinary.coin_id())?
+            .expect("the source serves the ordinary coin's spend");
+        assert_eq!(
+            ordinary_spend.coin.parent_coin_info, did_coin_id,
+            "and that coin's own creator is the DID — the DID sits exactly two hops up"
+        );
+        assert!(
+            crate::did_ref_from_spend(&ordinary_spend)?.is_none()
+                && !super::is_launcher_intermediate(&ordinary_spend, launcher_spend.coin),
+            "the creator is neither a DID nor the recognised intermediate launcher — the only two \
+             shapes the walk can traverse, which is exactly why it stops"
+        );
+        assert!(
+            crate::did_ref_from_spend(
+                &chain
+                    .coin_spend(did_coin_id)?
+                    .expect("the source serves the DID spend")
+            )?
+            .is_some(),
+            "the DID spend IS present and IS recognisable, so only the ordinary hop stops the walk"
+        );
 
         assert_eq!(
             resolve_owner_did(store_id, &chain)?,

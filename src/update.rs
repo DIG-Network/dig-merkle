@@ -288,7 +288,8 @@ mod tests {
         let (owner, store) = minted_store(&mut sim)?;
 
         let mut ctx = SpendContext::new();
-        let prebuilt = StandardLayer::new(owner.pk).spend_with_conditions(&mut ctx, Conditions::new())?;
+        let prebuilt =
+            StandardLayer::new(owner.pk).spend_with_conditions(&mut ctx, Conditions::new())?;
 
         let result = update_root(
             &store,
