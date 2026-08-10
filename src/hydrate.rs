@@ -11,11 +11,41 @@
 //! [`MerkleError::MissingLineage`], and a spend missing a required hint/memo yields
 //! [`MerkleError::MissingHint`]. dig-merkle never fabricates missing chain state.
 
-use chia_wallet_sdk::driver::{DataStore, DriverError, SpendContext};
+use clvm_traits::ToClvm;
+
+use chia_wallet_sdk::driver::{DataStore, DriverError, Puzzle, SpendContext};
+use chia_wallet_sdk::prelude::Allocator;
 
 use crate::metadata::DigDataStoreMetadata;
-use crate::types::CoinSpend;
+use crate::types::{Bytes32, CoinSpend};
 use crate::{MerkleError, MerkleResult};
+
+/// Refuses a spend whose `puzzle_reveal` is not the puzzle its coin committed to.
+///
+/// A coin commits to exactly one puzzle, by hash. A `coin_id` binding cannot substitute for this
+/// check: `coin_id` is derived from the coin's OWN fields, so a hostile chain source can return a
+/// victim's genuine coin beside a forged reveal and satisfy it. Comparing the reveal's tree hash to
+/// `coin.puzzle_hash` is the only binding that sees the substitution.
+///
+/// This mirrors [`crate::read`]'s identical guard on the DID path and, like it, REFUSES rather than
+/// skipping — a skip would let the caller read the absence of a value as "no data on chain".
+fn require_reveal_matches_coin(spend: &CoinSpend) -> MerkleResult<()> {
+    let mut allocator = Allocator::new();
+    let puzzle_ptr = spend
+        .puzzle_reveal
+        .to_clvm(&mut allocator)
+        .map_err(|error| MerkleError::Parse(format!("puzzle reveal: {error}")))?;
+    let puzzle = Puzzle::parse(&allocator, puzzle_ptr);
+
+    if Bytes32::from(puzzle.curried_puzzle_hash()) != spend.coin.puzzle_hash {
+        return Err(MerkleError::Chain(format!(
+            "the puzzle reveal for coin {} does not hash to the coin's puzzle hash — the source \
+             returned a puzzle the coin never committed to",
+            spend.coin.coin_id()
+        )));
+    }
+    Ok(())
+}
 
 /// Reconstructs the spendable [`DataStore`] created by `parent_spend`.
 ///
@@ -30,8 +60,15 @@ use crate::{MerkleError, MerkleResult};
 ///   terminal melt), so there is no child to hydrate.
 /// - [`MerkleError::MissingHint`] — `parent_spend` is missing a hint/memo required to rebuild the
 ///   store's delegation set.
+/// - [`MerkleError::Chain`] — `parent_spend`'s `puzzle_reveal` does not hash to its
+///   `coin.puzzle_hash`, i.e. the source returned a puzzle the coin never committed to. Checked
+///   BEFORE any value is extracted, so no forged metadata is parsed and no chain-supplied CLVM is
+///   executed.
+/// - [`MerkleError::Parse`] — `parent_spend`'s puzzle reveal is not allocatable CLVM.
 /// - [`MerkleError::Driver`] — any other SDK parse failure.
 pub fn hydrate(parent_spend: &CoinSpend) -> MerkleResult<DataStore<DigDataStoreMetadata>> {
+    require_reveal_matches_coin(parent_spend)?;
+
     let mut ctx = SpendContext::new();
 
     match DataStore::<DigDataStoreMetadata>::from_spend(&mut ctx, parent_spend, &[]) {
@@ -102,6 +139,98 @@ mod tests {
             },
         )?;
         sim.spend_coins(updated.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
+        Ok(())
+    }
+
+    /// FAIL-CLOSED: a hostile chain source that pairs a VICTIM's genuine coin with an ATTACKER's
+    /// `puzzle_reveal`/`solution` must be refused, not parsed.
+    ///
+    /// Both stores are real and settled on the simulator, and both spends are genuine recreation
+    /// spends — only the pairing is forged. The coin is the victim's, so a `coin_id` binding (the one
+    /// dig-store's `read_verified_spend` performs) is SATISFIED: `coin_id` is computed from the
+    /// coin's own fields and cannot see the swapped reveal. Only comparing the reveal's tree hash to
+    /// `coin.puzzle_hash` catches it.
+    ///
+    /// The non-launcher branch is used deliberately: every launcher coin shares the singleton
+    /// launcher puzzle hash, so a launcher-branch fixture could not exhibit a hash mismatch and would
+    /// prove nothing. Here the two stores curry different launcher ids, so their singleton puzzle
+    /// hashes genuinely differ.
+    ///
+    /// The control below hydrates the victim's UNMODIFIED spend through the same code path, so a
+    /// guard that refused everything would fail this test rather than pass it.
+    #[test]
+    fn hydrate_refuses_a_reveal_the_coin_never_committed_to() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+
+        // A settled store plus the genuine recreation spend of its store coin.
+        let mut settled_store_with_recreation_spend =
+            |root: Bytes32| -> anyhow::Result<(CoinSpend, Bytes32)> {
+                let owner = sim.bls(1_000_000);
+                let owner_ph: Bytes32 = StandardArgs::curry_tree_hash(owner.pk).into();
+                let built = mint_datastore(
+                    owner.coin,
+                    Owner::Standard(owner.pk),
+                    root,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    owner_ph,
+                    vec![],
+                    0,
+                )?;
+                sim.spend_coins(built.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
+                let store = built.child.expect("mint yields a child");
+                let launcher_id = store.info.launcher_id;
+
+                let updated = crate::update::update_root(
+                    &store,
+                    Owner::Standard(owner.pk),
+                    DigDataStoreMetadata {
+                        root_hash: root,
+                        ..Default::default()
+                    },
+                )?;
+                sim.spend_coins(updated.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
+                Ok((updated.coin_spends[0].clone(), launcher_id))
+            };
+
+        let victim_root = Bytes32::new([0x11; 32]);
+        let attacker_root = Bytes32::new([0xee; 32]);
+        let (victim_spend, victim_launcher_id) = settled_store_with_recreation_spend(victim_root)?;
+        let (attacker_spend, _) = settled_store_with_recreation_spend(attacker_root)?;
+
+        // The two stores really do commit to different puzzles — otherwise the swap below would be
+        // indistinguishable from the honest spend and the test would be vacuous.
+        assert_ne!(
+            victim_spend.coin.puzzle_hash, attacker_spend.coin.puzzle_hash,
+            "fixture precondition: the forged reveal must differ from the coin's committed puzzle"
+        );
+
+        let forged = CoinSpend::new(
+            victim_spend.coin,
+            attacker_spend.puzzle_reveal.clone(),
+            attacker_spend.solution.clone(),
+        );
+
+        match hydrate(&forged) {
+            Err(MerkleError::Chain(message)) => {
+                assert!(
+                    message.contains("does not hash to"),
+                    "refusal must name the unbound reveal, got: {message}"
+                );
+            }
+            other => panic!(
+                "a reveal the coin never committed to must be REFUSED, not parsed; got {:?}",
+                other.map(|store| (store.info.launcher_id, store.info.metadata.root_hash))
+            ),
+        }
+
+        // CONTROL: the victim's own spend, unmodified, still hydrates to the victim's store.
+        let honest = hydrate(&victim_spend)?;
+        assert_eq!(honest.info.launcher_id, victim_launcher_id);
+        assert_eq!(honest.info.metadata.root_hash, victim_root);
         Ok(())
     }
 
