@@ -105,6 +105,99 @@ mod tests {
         Ok(())
     }
 
+    /// FAIL-CLOSED: a hostile chain source that pairs a VICTIM's genuine coin with an ATTACKER's
+    /// `puzzle_reveal`/`solution` must be refused, not parsed.
+    ///
+    /// Both stores are real and settled on the simulator, and both spends are genuine recreation
+    /// spends — only the pairing is forged. The coin is the victim's, so a `coin_id` binding (the one
+    /// dig-store's `read_verified_spend` performs) is SATISFIED: `coin_id` is computed from the
+    /// coin's own fields and cannot see the swapped reveal. Only comparing the reveal's tree hash to
+    /// `coin.puzzle_hash` catches it.
+    ///
+    /// The non-launcher branch is used deliberately: every launcher coin shares the singleton
+    /// launcher puzzle hash, so a launcher-branch fixture could not exhibit a hash mismatch and would
+    /// prove nothing. Here the two stores curry different launcher ids, so their singleton puzzle
+    /// hashes genuinely differ.
+    ///
+    /// The control below hydrates the victim's UNMODIFIED spend through the same code path, so a
+    /// guard that refused everything would fail this test rather than pass it.
+    #[test]
+    fn hydrate_refuses_a_reveal_the_coin_never_committed_to() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+
+        // A settled store plus the genuine recreation spend of its store coin.
+        let mut settled_store_with_recreation_spend =
+            |root: Bytes32| -> anyhow::Result<(CoinSpend, Bytes32)> {
+                let owner = sim.bls(1_000_000);
+                let owner_ph: Bytes32 = StandardArgs::curry_tree_hash(owner.pk).into();
+                let built = mint_datastore(
+                    owner.coin,
+                    Owner::Standard(owner.pk),
+                    root,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    owner_ph,
+                    vec![],
+                    0,
+                )?;
+                sim.spend_coins(built.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
+                let store = built.child.expect("mint yields a child");
+                let launcher_id = store.info.launcher_id;
+
+                let updated = crate::update::update_root(
+                    &store,
+                    Owner::Standard(owner.pk),
+                    DigDataStoreMetadata {
+                        root_hash: root,
+                        ..Default::default()
+                    },
+                )?;
+                sim.spend_coins(updated.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
+                Ok((updated.coin_spends[0].clone(), launcher_id))
+            };
+
+        let victim_root = Bytes32::new([0x11; 32]);
+        let attacker_root = Bytes32::new([0xee; 32]);
+        let (victim_spend, victim_launcher_id) =
+            settled_store_with_recreation_spend(victim_root)?;
+        let (attacker_spend, _) = settled_store_with_recreation_spend(attacker_root)?;
+
+        // The two stores really do commit to different puzzles — otherwise the swap below would be
+        // indistinguishable from the honest spend and the test would be vacuous.
+        assert_ne!(
+            victim_spend.coin.puzzle_hash, attacker_spend.coin.puzzle_hash,
+            "fixture precondition: the forged reveal must differ from the coin's committed puzzle"
+        );
+
+        let forged = CoinSpend::new(
+            victim_spend.coin,
+            attacker_spend.puzzle_reveal.clone(),
+            attacker_spend.solution.clone(),
+        );
+
+        match hydrate(&forged) {
+            Err(MerkleError::Chain(message)) => {
+                assert!(
+                    message.contains("does not hash to"),
+                    "refusal must name the unbound reveal, got: {message}"
+                );
+            }
+            other => panic!(
+                "a reveal the coin never committed to must be REFUSED, not parsed; got {:?}",
+                other.map(|store| (store.info.launcher_id, store.info.metadata.root_hash))
+            ),
+        }
+
+        // CONTROL: the victim's own spend, unmodified, still hydrates to the victim's store.
+        let honest = hydrate(&victim_spend)?;
+        assert_eq!(honest.info.launcher_id, victim_launcher_id);
+        assert_eq!(honest.info.metadata.root_hash, victim_root);
+        Ok(())
+    }
+
     /// FAIL-CLOSED: a plain (non-DataLayer) standard coin spend hydrates to `NotDataStore`, never a
     /// fabricated store.
     #[test]
