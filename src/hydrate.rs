@@ -198,8 +198,7 @@ mod tests {
 
         let victim_root = Bytes32::new([0x11; 32]);
         let attacker_root = Bytes32::new([0xee; 32]);
-        let (victim_spend, victim_launcher_id) =
-            settled_store_with_recreation_spend(victim_root)?;
+        let (victim_spend, victim_launcher_id) = settled_store_with_recreation_spend(victim_root)?;
         let (attacker_spend, _) = settled_store_with_recreation_spend(attacker_root)?;
 
         // The two stores really do commit to different puzzles — otherwise the swap below would be

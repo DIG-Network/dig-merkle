@@ -401,6 +401,15 @@ coin spend (`DataStore::from_spend`) and the `LineageProof` a singleton child re
 
 dig-merkle never guesses missing chain state; the caller supplies the real parent spend.
 
+**Reveal binding is MANDATORY (NC-9).** BEFORE any value is extracted from a parent spend, `hydrate`
+MUST verify `tree_hash(puzzle_reveal) == spend.coin.puzzle_hash` and reject a mismatch with
+`Err(MerkleError::Chain)`. A `coin_id` binding cannot substitute for this: `coin_id` is derived from
+the coin's own fields, so a hostile source can pair a victim's genuine coin with a different store's
+`puzzle_reveal` and `solution` and have hydration report the ATTACKER's `launcher_id` and
+`root_hash`. Because the check precedes the parse, a forged spend also never reaches the CLVM
+execution on the non-launcher branch. The failure is a REFUSAL, never a skip or an empty result — a
+caller must not be able to read a substituted answer as "no data on chain".
+
 **Child lineage proof — the DataLayer updater path (INV-4).** `child_lineage_proof` derives the
 `parent_inner_puzzle_hash` a child singleton must attest to by reconstructing the store's NFT-state-
 layer tree hash the SAME way a real on-chain DataLayer coin is built: currying
