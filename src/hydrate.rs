@@ -11,11 +11,41 @@
 //! [`MerkleError::MissingLineage`], and a spend missing a required hint/memo yields
 //! [`MerkleError::MissingHint`]. dig-merkle never fabricates missing chain state.
 
-use chia_wallet_sdk::driver::{DataStore, DriverError, SpendContext};
+use clvm_traits::ToClvm;
+
+use chia_wallet_sdk::driver::{DataStore, DriverError, Puzzle, SpendContext};
+use chia_wallet_sdk::prelude::Allocator;
 
 use crate::metadata::DigDataStoreMetadata;
-use crate::types::CoinSpend;
+use crate::types::{Bytes32, CoinSpend};
 use crate::{MerkleError, MerkleResult};
+
+/// Refuses a spend whose `puzzle_reveal` is not the puzzle its coin committed to.
+///
+/// A coin commits to exactly one puzzle, by hash. A `coin_id` binding cannot substitute for this
+/// check: `coin_id` is derived from the coin's OWN fields, so a hostile chain source can return a
+/// victim's genuine coin beside a forged reveal and satisfy it. Comparing the reveal's tree hash to
+/// `coin.puzzle_hash` is the only binding that sees the substitution.
+///
+/// This mirrors [`crate::read`]'s identical guard on the DID path and, like it, REFUSES rather than
+/// skipping — a skip would let the caller read the absence of a value as "no data on chain".
+fn require_reveal_matches_coin(spend: &CoinSpend) -> MerkleResult<()> {
+    let mut allocator = Allocator::new();
+    let puzzle_ptr = spend
+        .puzzle_reveal
+        .to_clvm(&mut allocator)
+        .map_err(|error| MerkleError::Parse(format!("puzzle reveal: {error}")))?;
+    let puzzle = Puzzle::parse(&allocator, puzzle_ptr);
+
+    if Bytes32::from(puzzle.curried_puzzle_hash()) != spend.coin.puzzle_hash {
+        return Err(MerkleError::Chain(format!(
+            "the puzzle reveal for coin {} does not hash to the coin's puzzle hash — the source \
+             returned a puzzle the coin never committed to",
+            spend.coin.coin_id()
+        )));
+    }
+    Ok(())
+}
 
 /// Reconstructs the spendable [`DataStore`] created by `parent_spend`.
 ///
@@ -30,8 +60,15 @@ use crate::{MerkleError, MerkleResult};
 ///   terminal melt), so there is no child to hydrate.
 /// - [`MerkleError::MissingHint`] — `parent_spend` is missing a hint/memo required to rebuild the
 ///   store's delegation set.
+/// - [`MerkleError::Chain`] — `parent_spend`'s `puzzle_reveal` does not hash to its
+///   `coin.puzzle_hash`, i.e. the source returned a puzzle the coin never committed to. Checked
+///   BEFORE any value is extracted, so no forged metadata is parsed and no chain-supplied CLVM is
+///   executed.
+/// - [`MerkleError::Parse`] — `parent_spend`'s puzzle reveal is not allocatable CLVM.
 /// - [`MerkleError::Driver`] — any other SDK parse failure.
 pub fn hydrate(parent_spend: &CoinSpend) -> MerkleResult<DataStore<DigDataStoreMetadata>> {
+    require_reveal_matches_coin(parent_spend)?;
+
     let mut ctx = SpendContext::new();
 
     match DataStore::<DigDataStoreMetadata>::from_spend(&mut ctx, parent_spend, &[]) {
