@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.7.0] - 2026-08-10
+
+### Bug Fixes
+- **hydrate:** Bind puzzle_reveal to the coin puzzle hash before trusting a spend (#12)
+
 ## [0.6.0] - 2026-08-09
 
 ### Bug Fixes
