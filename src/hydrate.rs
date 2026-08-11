@@ -368,4 +368,63 @@ mod tests {
         );
         Ok(())
     }
+
+    /// ADVERSARIAL: launcher-branch forge — genuine launcher coin + genuine (universal) launcher
+    /// reveal + ATTACKER solution declaring an arbitrary root.
+    #[test]
+    fn adversarial_launcher_branch_forge() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let owner = sim.bls(1_000_000);
+        let owner_ph: Bytes32 = StandardArgs::curry_tree_hash(owner.pk).into();
+        let victim_root = Bytes32::new([0x11; 32]);
+        let built = mint_datastore(
+            owner.coin,
+            Owner::Standard(owner.pk),
+            victim_root,
+            None, None, None, None, None,
+            owner_ph,
+            vec![],
+            0,
+        )?;
+        sim.spend_coins(built.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
+        let minted = built.child.expect("child");
+        let launcher_spend = built
+            .coin_spends
+            .iter()
+            .find(|s| s.coin.coin_id() == minted.info.launcher_id)
+            .expect("launcher spend");
+
+        let attacker_root = Bytes32::new([0xee; 32]);
+        let kv = DlLauncherKvList {
+            metadata: DigDataStoreMetadata {
+                root_hash: attacker_root,
+                ..Default::default()
+            },
+            state_layer_inner_puzzle_hash: owner_ph,
+            memos: vec![Bytes::from(owner_ph.to_vec())],
+        };
+        let solution = LauncherSolution {
+            singleton_puzzle_hash: Bytes32::new([0x44; 32]),
+            amount: 1,
+            key_value_list: kv,
+        };
+        let mut ctx = SpendContext::new();
+        let sp = ctx.alloc(&solution)?;
+        let forged_solution = ctx.serialize(&sp)?;
+        let forged = CoinSpend::new(
+            launcher_spend.coin,
+            launcher_spend.puzzle_reveal.clone(),
+            forged_solution,
+        );
+        let out = hydrate(&forged);
+        println!("ADVERSARIAL RESULT: {:?}", out.as_ref().map(|s| (s.info.launcher_id, s.info.metadata.root_hash)));
+        assert!(
+            out.is_err(),
+            "FORGED launcher spend hydrated! launcher_id={:?} root={:?} victim_root={:?}",
+            out.as_ref().unwrap().info.launcher_id,
+            out.as_ref().unwrap().info.metadata.root_hash,
+            victim_root
+        );
+        Ok(())
+    }
 }
