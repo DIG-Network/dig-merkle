@@ -284,6 +284,25 @@ the owner's `AGG_SIG_ME`. `Owner::Custom` MUST be REJECTED with `MerkleError::Un
 `MELT_SINGLETON` condition is built inside the call, so a pre-built inner spend cannot contain it and
 the returned bundle would melt nothing while reporting success.
 
+**Authority MUST be gated before the spend is built.** `melt` MUST reject with
+`MerkleError::NotTheOwner`, before it constructs a `SpendContext` or any condition, unless
+`StandardArgs::curry_tree_hash(pk)` equals `store.info.owner_puzzle_hash` — the same commitment the
+store's own puzzle enforces on chain for an owner spend. The gate MUST key on
+`info.owner_puzzle_hash` and NOT on `coin.puzzle_hash`: a store carrying delegated puzzles wears a
+delegation layer curried OVER the owner's p2 hash, so a gate on the coin's hash would refuse the
+legitimate owner of a delegated store. Both store shapes — with and without delegated puzzles — MUST
+admit their owner and refuse everyone else.
+
+This is not a theft barrier; the chain is. A melt built with the wrong key can never confirm, because
+the caller cannot produce the required `AGG_SIG_ME`. The gate exists because a melt is
+**irreversible**: the builder MUST NOT hand back a fully-formed destructive spend against a store the
+caller does not own, whose only symptom is an opaque mempool rejection distant from its cause.
+
+**The melted amount is unrecoverable by construction.** The singleton top layer admits AT MOST ONE
+odd-amount `CREATE_COIN`, and the melt magic condition `(51 () -113)` occupies it. The coin's amount
+therefore cannot be paid out in this spend and becomes an implicit fee to the farmer — one mojo for a
+conventional store. No recovery path exists at any layer, and none MUST be added.
+
 **`Owner::Custom` is unusable across the whole public API.** A `Spend` holds CLVM node pointers valid
 only in the allocator that built them, and no public operation exposes its `SpendContext` for a caller
 to build one in. A custom/DID-authorized parent composes a launch through §3.1a instead, building its
@@ -458,6 +477,7 @@ substitution is distinguishable from a genuinely non-DID-owned store.
 | `Permission(String)` | a delegated-puzzle op lacks its required authority (e.g. writer→admin) |
 | `Chain(String)` | a chain-level precondition is violated (e.g. launcher mismatch, an unbound spend) |
 | `UnsupportedOwner(&'static str)` | the operation builds the conditions its spend must emit, so `Owner::Custom` cannot authorize it (§3.1, §3.2, §3.5) |
+| `NotTheOwner` | an irreversible operation was asked for with a key that does not curry to the store's `owner_puzzle_hash` (§3.5); raised before any spend is built |
 | `EmptyCoins` | an operation was given an empty coin set |
 | `InvalidSize(String)` | a size-bucket exponent or byte length falls outside the `0..=10` ladder (§2) |
 
@@ -470,6 +490,10 @@ substitution is distinguishable from a genuinely non-DID-owned store.
   byte-identical coin spends, so a spend can be independently reproduced and audited.
 - **Fail-closed:** hydration and permission checks reject on missing/invalid state (§5, §6) rather
   than producing an unspendable or over-authorized bundle.
+- **Irreversible operations refuse in the builder:** `melt` (§3.5) verifies the caller's key controls
+  the store BEFORE any spend exists, so an unauthorized destructive spend is never constructed. The
+  refusal's warrant is the supplied `DataStore`; a store obtained through `hydrate` carries the real
+  owner, because hydration binds a parsed puzzle reveal to the coin's puzzle hash (§5).
 
 ## 8. Back-compat (CLAUDE.md §5.1 — additive only)
 

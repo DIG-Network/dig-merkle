@@ -298,8 +298,17 @@ mod tests {
              otherwise this shape cannot distinguish a gate keyed on the wrong field"
         );
 
-        let _owner_can = melt(&store, Owner::Standard(owner.pk))
+        let built = melt(&store, Owner::Standard(owner.pk))
             .expect("the owner of a delegated store must still be able to melt it");
+
+        // Not merely "the builder returned Ok": the delegation layer must actually admit the melt
+        // through its owner path, and the store must really be gone afterwards.
+        sim.spend_coins(built.coin_spends, std::slice::from_ref(&owner.sk))?;
+        assert!(
+            sim.coin_state(store.coin.coin_id())
+                .is_some_and(|state| state.spent_height.is_some()),
+            "the owner's melt of a delegated store must confirm, not merely build"
+        );
         Ok(())
     }
 
