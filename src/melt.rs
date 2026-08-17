@@ -21,6 +21,19 @@ use crate::{MerkleError, MerkleResult};
 /// the singleton is melted and no child DataStore is recreated. The one coin spend produced is
 /// returned unsigned.
 ///
+/// # This is irreversible, and the caller must mean it
+///
+/// A launcher id is derived from a coin that has been spent, so a melted store can never be
+/// recreated: every `dig://` reference anchored to it becomes permanently unresolvable. There is no
+/// undo at any layer.
+///
+/// The coin's amount is not recoverable either, and that is structural rather than an omission: the
+/// singleton top layer admits AT MOST ONE odd-amount `CREATE_COIN`, and the melt magic condition
+/// `(51 () -113)` occupies it. A second odd-amount output makes the puzzle fail outright, and an
+/// even-amount output cannot carry an odd singleton's whole amount. The amount is therefore an
+/// implicit fee to the farmer — one mojo for a conventional store. **Do not add a recovery path**;
+/// none can exist in this spend.
+///
 /// # Signing
 ///
 /// An [`Owner::Standard`] melt requires exactly one `AGG_SIG_ME` over the owner's synthetic key.
@@ -35,6 +48,11 @@ use crate::{MerkleError, MerkleResult};
 /// (`Owner::Custom` is in practice unusable across this crate's whole public API: a
 /// [`chia_wallet_sdk::driver::Spend`] holds CLVM node pointers valid only in the allocator that built
 /// them, and no public operation exposes its [`SpendContext`] for the caller to build one in.)
+///
+/// Returns [`MerkleError::NotTheOwner`] if `owner`'s key does not curry to the store's current
+/// `owner_puzzle_hash` — i.e. the caller cannot prove it controls the singleton. Because the melt is
+/// irreversible, authority is checked BEFORE any spend exists rather than left to fail at mempool
+/// admission with a signature the caller could never produce (#3045).
 ///
 /// Returns [`MerkleError::Driver`] if the SDK fails to build the melt spend.
 pub fn melt(
