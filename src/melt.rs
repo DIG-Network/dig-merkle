@@ -6,6 +6,7 @@
 //! [`Owner::Standard`] melt requires exactly one `AGG_SIG_ME` over the owner's synthetic key,
 //! obtained via [`crate::required_signatures`].
 
+use chia_puzzle_types::standard::StandardArgs;
 use chia_wallet_sdk::driver::{DataStore, SpendContext};
 use chia_wallet_sdk::types::Conditions;
 
@@ -47,6 +48,8 @@ pub fn melt(
         ));
     }
 
+    gate_owner_controls_store(store, owner)?;
+
     let mut ctx = SpendContext::new();
 
     let conditions = Conditions::new().melt_singleton();
@@ -56,13 +59,54 @@ pub fn melt(
     Ok(MerkleCoinSpend::new(vec![store_spend], None))
 }
 
+/// Refuses `owner` unless its key curries to the store's current `owner_puzzle_hash`.
+///
+/// The check is `StandardArgs::curry_tree_hash(pk) == store.info.owner_puzzle_hash` — the same
+/// commitment the store's own puzzle enforces on chain, evaluated here so an unauthorized melt is
+/// refused before a spend exists. Fail-closed by construction: only an exact match proceeds, and
+/// the non-`Standard` arm refuses rather than falling through, so this helper is total on its own
+/// and does not rely on [`melt`]'s earlier `Owner::Custom` refusal still being there.
+///
+/// # Why `info.owner_puzzle_hash` and not the coin's puzzle hash
+///
+/// A store may carry delegated puzzles, in which case the coin wears a delegation layer curried
+/// OVER the owner's p2 puzzle hash, and `coin.puzzle_hash` is neither the owner's nor stable across
+/// the two shapes. `info.owner_puzzle_hash` is the field the owner path authenticates against in
+/// BOTH shapes (see `DataStore::spend`, whose delegated branch supplies `merkle_proof: None` for an
+/// owner spend), so keying the gate on it refuses a stranger without locking out the owner of a
+/// delegated store.
+///
+/// # What this gate is, and is not
+///
+/// It decides on `store.info.owner_puzzle_hash`, the SAME field and the SAME value that the spend
+/// below is then built from — there is no window in which a caller could vary the authority after
+/// it was granted, because the authorization and the construction read one value in one call. Its
+/// warrant is only as good as the `DataStore` handed in: a caller that fabricates an `info` it does
+/// not own defeats its own guard and gets a spend that cannot confirm. That is acceptable, because
+/// the value protected here is the caller who obtained the store honestly — [`crate::hydrate`]
+/// binds a parsed store's puzzle reveal to the coin's puzzle hash, so a store read from chain
+/// carries the real owner and this refusal is real.
+fn gate_owner_controls_store<M>(store: &DataStore<M>, owner: Owner) -> MerkleResult<()> {
+    let Owner::Standard(public_key) = owner else {
+        return Err(MerkleError::UnsupportedOwner(
+            "melt requires Owner::Standard to prove control of the store",
+        ));
+    };
+
+    if StandardArgs::curry_tree_hash(public_key) != store.info.owner_puzzle_hash.into() {
+        return Err(MerkleError::NotTheOwner);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mint::mint_datastore;
     use crate::required_signatures;
-    use crate::types::{Bytes32, DataStore};
+    use crate::types::{Bytes32, DataStore, DelegatedPuzzle};
     use chia_puzzle_types::standard::StandardArgs;
+    use chia_wallet_sdk::clvm_utils::TreeHash;
     use chia_wallet_sdk::prelude::MAINNET_CONSTANTS;
     use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature};
     use chia_wallet_sdk::test::Simulator;
@@ -70,6 +114,22 @@ mod tests {
     /// Mints and settles a store on the simulator, returning the owner keypair and the eve store.
     fn minted_store(
         sim: &mut Simulator,
+    ) -> anyhow::Result<(
+        chia_wallet_sdk::test::BlsPairWithCoin,
+        DataStore<DigDataStoreMetadata>,
+    )> {
+        minted_store_with_delegation(sim, vec![])
+    }
+
+    /// As [`minted_store`], but the settled store carries `delegated_puzzles`.
+    ///
+    /// The owner's authority over a store with a delegation layer is committed in the SAME field as
+    /// one without (`info.owner_puzzle_hash`; the delegation layer is curried OVER it), so this
+    /// shape exists to prove the gate reads that field rather than the coin's outer puzzle hash —
+    /// which differs between the two shapes and would refuse a legitimate owner here.
+    fn minted_store_with_delegation(
+        sim: &mut Simulator,
+        delegated_puzzles: Vec<DelegatedPuzzle>,
     ) -> anyhow::Result<(
         chia_wallet_sdk::test::BlsPairWithCoin,
         DataStore<DigDataStoreMetadata>,
@@ -86,7 +146,7 @@ mod tests {
             None,
             None,
             owner_ph,
-            vec![],
+            delegated_puzzles,
             0,
         )?;
         sim.spend_coins(built.coin_spends.clone(), std::slice::from_ref(&owner.sk))?;
@@ -150,5 +210,113 @@ mod tests {
         }
         Ok(())
     }
-}
 
+    /// THE acceptance property (#3045): a melt is REFUSED when the supplied owner key does not
+    /// control the store, before any spend exists.
+    ///
+    /// Until this gate, `melt` refused only `Owner::Custom` and asked nothing else, so this call
+    /// returned `Ok` — a fully-built, irreversible destructive spend against a store the caller
+    /// does not own, handed back for signing.
+    #[test]
+    fn a_melt_by_a_non_owner_is_refused() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let (owner, store) = minted_store(&mut sim)?;
+        let stranger = sim.bls(0);
+
+        // Control: the SAME store melts for its real owner, so the refusal below is attributable to
+        // the key and not to something else about this store.
+        let _owner_can = melt(&store, Owner::Standard(owner.pk))
+            .expect("the real owner must still be able to melt this store");
+
+        let result = melt(&store, Owner::Standard(stranger.pk));
+
+        assert!(
+            matches!(result, Err(MerkleError::NotTheOwner)),
+            "a melt by a key that does not control the store must be refused, got: {result:?}"
+        );
+        Ok(())
+    }
+
+    /// A refused melt destroys NOTHING — and the paired owner melt proves that is not vacuous.
+    ///
+    /// `Err` alone does not establish that no damage occurred; it only establishes what this call
+    /// returned. So the store coin is asked of the simulator directly: it is live before, still
+    /// live after the stranger's attempt, and spent only once its real owner melts it. Without the
+    /// final leg, "still live" would also hold for a harness where no melt could ever work.
+    #[test]
+    fn a_refused_melt_leaves_the_store_alive_while_the_owners_melt_ends_it() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let (owner, store) = minted_store(&mut sim)?;
+        let stranger = sim.bls(0);
+
+        assert!(
+            sim.coin_state(store.coin.coin_id())
+                .is_some_and(|state| state.spent_height.is_none()),
+            "the store must be live before anyone tries to melt it"
+        );
+
+        let refused = melt(&store, Owner::Standard(stranger.pk));
+        assert!(matches!(refused, Err(MerkleError::NotTheOwner)));
+
+        assert!(
+            sim.coin_state(store.coin.coin_id())
+                .is_some_and(|state| state.spent_height.is_none()),
+            "a refused melt must leave the store singleton untouched on chain"
+        );
+
+        let built = melt(&store, Owner::Standard(owner.pk))?;
+        sim.spend_coins(built.coin_spends, std::slice::from_ref(&owner.sk))?;
+
+        assert!(
+            sim.coin_state(store.coin.coin_id())
+                .is_some_and(|state| state.spent_height.is_some()),
+            "the owner's melt must really spend the store coin, or the assertions above are vacuous"
+        );
+        Ok(())
+    }
+
+    /// A CONTROL against an OVER-STRICT gate: the owner of a store carrying delegated puzzles must
+    /// still be able to melt it.
+    ///
+    /// A delegation layer changes the coin's outer puzzle hash but NOT `info.owner_puzzle_hash` —
+    /// it is curried over it. A gate keyed on the coin's puzzle hash would pass the plain shape and
+    /// refuse this one, locking a legitimate owner out of their own store. Refusing too much is as
+    /// much a defect as refusing too little, and only this shape can see it.
+    #[test]
+    fn the_owner_of_a_store_with_delegated_puzzles_may_still_melt() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let delegated = vec![DelegatedPuzzle::Admin(TreeHash::new([0x11; 32]))];
+        let (owner, store) = minted_store_with_delegation(&mut sim, delegated)?;
+
+        assert!(
+            !store.info.delegated_puzzles.is_empty(),
+            "this control is meaningless unless the store really carries a delegation layer"
+        );
+        assert_ne!(
+            store.coin.puzzle_hash, store.info.owner_puzzle_hash,
+            "the delegation layer must make the coin's puzzle hash differ from the owner's, \
+             otherwise this shape cannot distinguish a gate keyed on the wrong field"
+        );
+
+        let _owner_can = melt(&store, Owner::Standard(owner.pk))
+            .expect("the owner of a delegated store must still be able to melt it");
+        Ok(())
+    }
+
+    /// The gate refuses a stranger on a delegated store too — the delegation layer is not a hole.
+    #[test]
+    fn a_non_owner_melt_of_a_delegated_store_is_also_refused() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let delegated = vec![DelegatedPuzzle::Admin(TreeHash::new([0x11; 32]))];
+        let (_owner, store) = minted_store_with_delegation(&mut sim, delegated)?;
+        let stranger = sim.bls(0);
+
+        let result = melt(&store, Owner::Standard(stranger.pk));
+
+        assert!(
+            matches!(result, Err(MerkleError::NotTheOwner)),
+            "a delegation layer must not admit a melt by a non-owner, got: {result:?}"
+        );
+        Ok(())
+    }
+}
