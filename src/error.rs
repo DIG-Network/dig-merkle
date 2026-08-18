@@ -62,6 +62,18 @@ pub enum MerkleError {
     #[error("unsupported owner: {0}")]
     UnsupportedOwner(&'static str),
 
+    /// The supplied owner key does not control the store: it does not curry to the store's current
+    /// `owner_puzzle_hash`.
+    ///
+    /// Raised by irreversible operations — [`crate::melt()`] — BEFORE any spend is built. Such a
+    /// spend could never confirm anyway (the caller cannot produce the `AGG_SIG_ME` the store's own
+    /// puzzle demands), so this is not a theft barrier; the chain is. What it prevents is a builder
+    /// handing back a fully-formed, irreversible destructive spend against someone else's store,
+    /// whose only symptom is an opaque mempool rejection far from the call that caused it
+    /// (SPEC §5, fail-closed).
+    #[error("the supplied owner key does not control this store: it does not curry to the store's current owner puzzle hash")]
+    NotTheOwner,
+
     /// A chain-level precondition was violated (e.g. a supplied coin does not match the expected
     /// launcher). The string states the specific violation.
     #[error("chain precondition failed: {0}")]
