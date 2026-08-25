@@ -10,7 +10,7 @@
 //! ## The DataLayer coin
 //!
 //! A DataLayer coin is a CHIP-0035 singleton whose `launcher_id` IS the DIG `store_id`. Its
-//! [`DataStoreMetadata`] carries the capsule's `root_hash` (the anchored `.dig` merkle root) plus
+//! [`DatastoreMetadata`] carries the capsule's `root_hash` (the anchored `.dig` merkle root) plus
 //! optional `label`/`description`/`size_proof`, the additive `program_hash` (`"p"`), and the store
 //! size as a power-of-2 `size_bucket` (`"sz"` — see [`SizeBucket`]) that REPLACES the SDK's exact
 //! `bytes`/`"b"` field, and its [`DelegatedPuzzle`] list grants
@@ -28,11 +28,11 @@
 //!   computes what must be signed ([`required_signatures`]); the caller's signer produces the
 //!   signatures.
 //! - **INV-3 — Unsigned output.** Every operation returns an unsigned [`MerkleCoinSpend`] — coin
-//!   spends plus the recreated child DataStore. Signatures are always the caller's responsibility.
+//!   spends plus the recreated child Datastore. Signatures are always the caller's responsibility.
 //! - **INV-4 — SDK byte-source-of-truth.** Every puzzle, layer, and coin-spend byte is produced by
 //!   `chia-wallet-sdk` (pinned to the 0.30 / chia-protocol 0.26 family, `chip-0035` feature).
 //!   dig-merkle adds DataLayer-workflow ergonomics on top; it never re-implements a puzzle or
-//!   hand-rolls a spend bundle, and re-exports the SDK's DataStore types verbatim.
+//!   hand-rolls a spend bundle, and re-exports the SDK's Datastore types verbatim.
 //!
 //! ## Consumer pattern
 //!
@@ -43,7 +43,7 @@
 //!
 //! ## Operation surface
 //!
-//! On the foundation (the type surface [`MerkleCoinSpend`]/[`Owner`] + re-exported SDK DataStore
+//! On the foundation (the type surface [`MerkleCoinSpend`]/[`Owner`] + re-exported SDK Datastore
 //! types, the error taxonomy [`MerkleError`], the inner-spend helpers, and the signing boundary
 //! [`required_signatures`]) the crate ships the DataLayer-coin lifecycle:
 //! - [`mint_datastore`] / [`mint_datastore_with_kind`] — launch a new DataLayer coin anchoring a
@@ -51,7 +51,7 @@
 //! - [`update_root`] — recreate the coin with new metadata (a new merkle root), preserving identity.
 //! - [`melt()`] — terminally spend the coin, leaving no successor.
 //! - [`did_ref_from_spend`] / [`resolve_owner_did`] — read owner-DID ownership without spending.
-//! - [`hydrate()`] — reconstruct a spendable [`DataStore`] from a parent coin spend (fail-closed).
+//! - [`hydrate()`] — reconstruct a spendable [`Datastore`] from a parent coin spend (fail-closed).
 //! - [`child_lineage_proof`] — derive the [`LineageProof`] a child spend requires.
 //! - [`launcher_hint_for`] / [`from_launcher_hint`] — the launcher-hint kind contract (SPEC §9).
 //!
@@ -113,7 +113,7 @@ pub use read::{did_ref_from_spend, resolve_owner_did, DidRef};
 pub use sign::required_signatures;
 pub use size::SizeBucket;
 pub use types::{
-    Bytes32, Coin, CoinSpend, Conditions, DataStore, DataStoreInfo, DataStoreMetadata,
+    Bytes32, Coin, CoinSpend, Conditions, Datastore, DatastoreInfo, DatastoreMetadata,
     DelegatedPuzzle, LineageProof, MerkleCoinSpend, Owner, Proof, SpendContext,
 };
 pub use update::update_root;

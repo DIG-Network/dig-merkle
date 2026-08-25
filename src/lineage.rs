@@ -2,10 +2,10 @@
 //!
 //! A singleton child spend must carry a [`LineageProof`] that attests to its parent's identity
 //! (parent's parent, parent's inner puzzle hash, parent's amount). [`child_lineage_proof`] derives
-//! that proof from a hydrated [`DataStore`] — the store as it exists now — so a caller can build the
+//! that proof from a hydrated [`Datastore`] — the store as it exists now — so a caller can build the
 //! next spend against it. It is a pure transform over the SDK's own derivation (INV-1, INV-4).
 
-use chia_wallet_sdk::driver::{get_merkle_tree, DataStore, NftStateLayer, SpendContext};
+use chia_wallet_sdk::driver::{get_merkle_tree, Datastore, NftStateLayer, SpendContext};
 use chia_wallet_sdk::prelude::{ToTreeHash, TreeHash};
 use chia_wallet_sdk::types::puzzles::{DelegationLayerArgs, DL_METADATA_UPDATER_PUZZLE_HASH};
 
@@ -19,8 +19,8 @@ use crate::MerkleResult;
 /// puzzle hash, and `store`'s amount — exactly the lineage a CHIP-0035 singleton verifies when it is
 /// recreated.
 ///
-/// We do NOT delegate `parent_inner_puzzle_hash` to the SDK's `DataStore::child_lineage_proof` /
-/// `DataStoreInfo::inner_puzzle_hash`: that path currys the NFT-DEFAULT metadata updater
+/// We do NOT delegate `parent_inner_puzzle_hash` to the SDK's `Datastore::child_lineage_proof` /
+/// `DatastoreInfo::inner_puzzle_hash`: that path currys the NFT-DEFAULT metadata updater
 /// (`NFT_METADATA_UPDATER_DEFAULT_HASH`, via `NftStateLayerArgs::curry_tree_hash`), whereas a real
 /// on-chain DataLayer coin currys `DL_METADATA_UPDATER_PUZZLE_HASH` (via
 /// `into_layers_without_delegation_layer` / `into_layers_with_delegation_layer`). The two updaters
@@ -33,7 +33,7 @@ use crate::MerkleResult;
 ///
 /// Returns [`MerkleError::Driver`](crate::MerkleError::Driver) if the store's metadata or delegated
 /// puzzles cannot be allocated to compute the inner puzzle hash.
-pub fn child_lineage_proof(store: &DataStore<DigDataStoreMetadata>) -> MerkleResult<LineageProof> {
+pub fn child_lineage_proof(store: &Datastore<DigDataStoreMetadata>) -> MerkleResult<LineageProof> {
     let mut ctx = SpendContext::new();
     Ok(LineageProof {
         parent_parent_coin_info: store.coin.parent_coin_info,
@@ -47,7 +47,7 @@ pub fn child_lineage_proof(store: &DataStore<DigDataStoreMetadata>) -> MerkleRes
 /// when they construct the real on-chain coin (#1332). This is the value a child singleton's lineage
 /// proof must carry.
 fn parent_inner_puzzle_hash(
-    store: &DataStore<DigDataStoreMetadata>,
+    store: &Datastore<DigDataStoreMetadata>,
     ctx: &mut SpendContext,
 ) -> MerkleResult<TreeHash> {
     let metadata_ptr = ctx.alloc(&store.info.metadata)?;
@@ -83,10 +83,10 @@ mod tests {
 
     /// GROUND TRUTH (#1332): the proof produced by [`child_lineage_proof`] must be BYTE-IDENTICAL to
     /// the lineage proof the SDK derives by PARSING the real on-chain parent puzzle (via
-    /// `DataStore::from_spend`, which sets a child's `.proof` from the actual singleton layer).
+    /// `Datastore::from_spend`, which sets a child's `.proof` from the actual singleton layer).
     ///
     /// The concern: `child_lineage_proof` derives `parent_inner_puzzle_hash` from
-    /// `DataStoreInfo::inner_puzzle_hash`, which currys the NFT-DEFAULT metadata updater
+    /// `DatastoreInfo::inner_puzzle_hash`, which currys the NFT-DEFAULT metadata updater
     /// (`NFT_METADATA_UPDATER_DEFAULT_HASH`), while a real DataLayer coin currys
     /// `DL_METADATA_UPDATER_PUZZLE_HASH` (via `into_layers_without_delegation_layer`). If the two
     /// updater hashes propagate into the inner-puzzle tree hash, the standalone proof would carry the
@@ -148,7 +148,7 @@ mod tests {
     /// consensus recomputes the parent coin id from `parent_inner_puzzle_hash` and rejects a mismatch).
     #[test]
     fn child_lineage_proof_produces_a_consensus_valid_child_spend() -> anyhow::Result<()> {
-        use crate::types::DataStore;
+        use crate::types::Datastore;
 
         let mut sim = Simulator::new();
         let owner = sim.bls(1_000_000);
@@ -184,7 +184,7 @@ mod tests {
         // Reconstruct store2 but with its proof supplied SOLELY by child_lineage_proof(store1) — the
         // exact path a lineage-walker (dig-store walk_lineage) takes to build the next spend. store2's
         // parent is store1, so a child-of-store1 proof is what a store2 spend must carry.
-        let store2_via_clp = DataStore::new(
+        let store2_via_clp = Datastore::new(
             store2.coin,
             Proof::Lineage(child_lineage_proof(&store1)?),
             store2.info.clone(),
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn child_lineage_proof_produces_a_consensus_valid_child_spend_for_a_delegated_store(
     ) -> anyhow::Result<()> {
-        use crate::types::{DataStore, DelegatedPuzzle};
+        use crate::types::{Datastore, DelegatedPuzzle};
 
         let mut sim = Simulator::new();
         let owner = sim.bls(1_000_000);
@@ -311,7 +311,7 @@ mod tests {
         let store2 = built2.child.expect("update yields a child");
 
         // Reconstruct store2 with its proof supplied SOLELY by child_lineage_proof(store1).
-        let store2_via_clp = DataStore::new(
+        let store2_via_clp = Datastore::new(
             store2.coin,
             Proof::Lineage(child_lineage_proof(&store1)?),
             store2.info.clone(),

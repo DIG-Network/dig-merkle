@@ -16,16 +16,16 @@ use crate::metadata::DigDataStoreMetadata;
 pub use chia_protocol::{Bytes32, Coin, CoinSpend};
 pub use chia_puzzle_types::{LineageProof, Proof};
 pub use chia_wallet_sdk::driver::{
-    DataStore, DataStoreInfo, DataStoreMetadata, DelegatedPuzzle, SpendContext,
+    Datastore, DatastoreInfo, DatastoreMetadata, DelegatedPuzzle, SpendContext,
 };
 pub use chia_wallet_sdk::types::Conditions;
 
 /// The result of building a DataLayer-coin operation: the unsigned coin spends plus the recreated
-/// child DataStore.
+/// child Datastore.
 ///
 /// This is the crate's output contract (INV-3). A `MerkleCoinSpend` carries NO signature — the
 /// consumer feeds `coin_spends` to [`crate::required_signatures`], signs the reported messages,
-/// assembles a `SpendBundle`, and broadcasts. `child` is the DataStore as it will exist AFTER the
+/// assembles a `SpendBundle`, and broadcasts. `child` is the Datastore as it will exist AFTER the
 /// spend confirms (`None` for a terminal operation such as a melt, which leaves no successor).
 #[derive(Debug, Clone)]
 #[must_use]
@@ -33,17 +33,17 @@ pub struct MerkleCoinSpend {
     /// The unsigned coin spends this operation produces, in spend order.
     pub coin_spends: Vec<CoinSpend>,
 
-    /// The DataStore as it will exist after these spends confirm, or `None` for a terminal
+    /// The Datastore as it will exist after these spends confirm, or `None` for a terminal
     /// operation. Its metadata is the DIG superset [`DigDataStoreMetadata`] (root + optional
     /// label/description/bytes/size-proof/program-hash).
-    pub child: Option<DataStore<DigDataStoreMetadata>>,
+    pub child: Option<Datastore<DigDataStoreMetadata>>,
 }
 
 impl MerkleCoinSpend {
-    /// Creates a [`MerkleCoinSpend`] from its coin spends and (optional) recreated child DataStore.
+    /// Creates a [`MerkleCoinSpend`] from its coin spends and (optional) recreated child Datastore.
     pub fn new(
         coin_spends: Vec<CoinSpend>,
-        child: Option<DataStore<DigDataStoreMetadata>>,
+        child: Option<Datastore<DigDataStoreMetadata>>,
     ) -> Self {
         Self { coin_spends, child }
     }

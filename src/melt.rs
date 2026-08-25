@@ -7,7 +7,7 @@
 //! obtained via [`crate::required_signatures`].
 
 use chia_puzzle_types::standard::StandardArgs;
-use chia_wallet_sdk::driver::{DataStore, SpendContext};
+use chia_wallet_sdk::driver::{Datastore, SpendContext};
 use chia_wallet_sdk::types::Conditions;
 
 use crate::context::inner_spend;
@@ -18,7 +18,7 @@ use crate::{MerkleError, MerkleResult};
 /// Terminally spends `store`, producing no successor coin (`child == None`).
 ///
 /// The store's inner puzzle emits a single `MELT_SINGLETON` condition (the SDK builder, INV-4), so
-/// the singleton is melted and no child DataStore is recreated. The one coin spend produced is
+/// the singleton is melted and no child Datastore is recreated. The one coin spend produced is
 /// returned unsigned.
 ///
 /// # This is irreversible, and the caller must mean it
@@ -56,7 +56,7 @@ use crate::{MerkleError, MerkleResult};
 ///
 /// Returns [`MerkleError::Driver`] if the SDK fails to build the melt spend.
 pub fn melt(
-    store: &DataStore<DigDataStoreMetadata>,
+    store: &Datastore<DigDataStoreMetadata>,
     owner: Owner,
 ) -> MerkleResult<MerkleCoinSpend> {
     if matches!(owner, Owner::Custom(_)) {
@@ -90,7 +90,7 @@ pub fn melt(
 /// A store may carry delegated puzzles, in which case the coin wears a delegation layer curried
 /// OVER the owner's p2 puzzle hash, and `coin.puzzle_hash` is neither the owner's nor stable across
 /// the two shapes. `info.owner_puzzle_hash` is the field the owner path authenticates against in
-/// BOTH shapes (see `DataStore::spend`, whose delegated branch supplies `merkle_proof: None` for an
+/// BOTH shapes (see `Datastore::spend`, whose delegated branch supplies `merkle_proof: None` for an
 /// owner spend), so keying the gate on it refuses a stranger without locking out the owner of a
 /// delegated store.
 ///
@@ -99,12 +99,12 @@ pub fn melt(
 /// It decides on `store.info.owner_puzzle_hash`, the SAME field and the SAME value that the spend
 /// below is then built from — there is no window in which a caller could vary the authority after
 /// it was granted, because the authorization and the construction read one value in one call. Its
-/// warrant is only as good as the `DataStore` handed in: a caller that fabricates an `info` it does
+/// warrant is only as good as the `Datastore` handed in: a caller that fabricates an `info` it does
 /// not own defeats its own guard and gets a spend that cannot confirm. That is acceptable, because
 /// the value protected here is the caller who obtained the store honestly — [`crate::hydrate`]
 /// binds a parsed store's puzzle reveal to the coin's puzzle hash, so a store read from chain
 /// carries the real owner and this refusal is real.
-fn gate_owner_controls_store<M>(store: &DataStore<M>, owner: Owner) -> MerkleResult<()> {
+fn gate_owner_controls_store<M>(store: &Datastore<M>, owner: Owner) -> MerkleResult<()> {
     let Owner::Standard(public_key) = owner else {
         return Err(MerkleError::UnsupportedOwner(
             "melt requires Owner::Standard to prove control of the store",
@@ -122,7 +122,7 @@ mod tests {
     use super::*;
     use crate::mint::mint_datastore;
     use crate::required_signatures;
-    use crate::types::{Bytes32, DataStore, DelegatedPuzzle};
+    use crate::types::{Bytes32, Datastore, DelegatedPuzzle};
     use chia_puzzle_types::standard::StandardArgs;
     use chia_wallet_sdk::clvm_utils::TreeHash;
     use chia_wallet_sdk::prelude::MAINNET_CONSTANTS;
@@ -134,7 +134,7 @@ mod tests {
         sim: &mut Simulator,
     ) -> anyhow::Result<(
         chia_wallet_sdk::test::BlsPairWithCoin,
-        DataStore<DigDataStoreMetadata>,
+        Datastore<DigDataStoreMetadata>,
     )> {
         minted_store_with_delegation(sim, vec![])
     }
@@ -150,7 +150,7 @@ mod tests {
         delegated_puzzles: Vec<DelegatedPuzzle>,
     ) -> anyhow::Result<(
         chia_wallet_sdk::test::BlsPairWithCoin,
-        DataStore<DigDataStoreMetadata>,
+        Datastore<DigDataStoreMetadata>,
     )> {
         let owner = sim.bls(1_000_000);
         let owner_ph: Bytes32 = StandardArgs::curry_tree_hash(owner.pk).into();

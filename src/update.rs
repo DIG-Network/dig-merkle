@@ -11,7 +11,7 @@
 //! requires exactly one `AGG_SIG_ME` over the owner's synthetic key, obtained via
 //! [`crate::required_signatures`].
 
-use chia_wallet_sdk::driver::{DataStore, SpendContext};
+use chia_wallet_sdk::driver::{Datastore, SpendContext};
 use chia_wallet_sdk::types::Conditions;
 
 use crate::context::inner_spend;
@@ -23,7 +23,7 @@ use crate::{MerkleError, MerkleResult};
 ///
 /// The store's inner puzzle emits two conditions — an NFT metadata update to `new_metadata` and a
 /// recreation `CREATE_COIN` back to the same owner puzzle hash carrying the same delegated puzzles —
-/// both built by the SDK (INV-4, never hand-rolled). The resulting child [`DataStore`] is hydrated
+/// both built by the SDK (INV-4, never hand-rolled). The resulting child [`Datastore`] is hydrated
 /// from the freshly-built spend and returned in [`MerkleCoinSpend::child`].
 ///
 /// # Metadata is replaced wholesale
@@ -54,7 +54,7 @@ use crate::{MerkleError, MerkleResult};
 /// spend, and [`MerkleError::NotDataStore`] if the freshly-built spend does not hydrate a child
 /// store (which would indicate a malformed recreation).
 pub fn update_root(
-    store: &DataStore<DigDataStoreMetadata>,
+    store: &Datastore<DigDataStoreMetadata>,
     owner: Owner,
     new_metadata: DigDataStoreMetadata,
 ) -> MerkleResult<MerkleCoinSpend> {
@@ -75,8 +75,8 @@ pub fn update_root(
     // The two conditions the inner puzzle emits: update the on-chain metadata, then recreate the
     // singleton back to the same owner with the same delegation set (the byte-source-of-truth SDK
     // helpers, INV-4).
-    let new_metadata_condition = DataStore::new_metadata_condition(&mut ctx, new_metadata)?;
-    let recreate_condition = DataStore::<DigDataStoreMetadata>::owner_create_coin_condition(
+    let new_metadata_condition = Datastore::new_metadata_condition(&mut ctx, new_metadata)?;
+    let recreate_condition = Datastore::<DigDataStoreMetadata>::owner_create_coin_condition(
         &mut ctx,
         launcher_id,
         owner_puzzle_hash,
@@ -94,7 +94,7 @@ pub fn update_root(
     // Hydrate the recreated child from the spend we just built, so callers get the post-update store
     // (with the new root/metadata) without re-fetching it from chain.
     let child =
-        DataStore::<DigDataStoreMetadata>::from_spend(&mut ctx, &store_spend, &delegated_puzzles)?
+        Datastore::<DigDataStoreMetadata>::from_spend(&mut ctx, &store_spend, &delegated_puzzles)?
             .ok_or(MerkleError::NotDataStore)?;
 
     Ok(MerkleCoinSpend::new(vec![store_spend], Some(child)))
@@ -105,20 +105,20 @@ mod tests {
     use super::*;
     use crate::mint::mint_datastore;
     use crate::required_signatures;
-    use crate::types::{Bytes32, DataStore, DataStoreInfo, DelegatedPuzzle};
+    use crate::types::{Bytes32, Datastore, DatastoreInfo, DelegatedPuzzle};
     use chia_puzzle_types::standard::StandardArgs;
     use chia_wallet_sdk::driver::{Layer, StandardLayer};
     use chia_wallet_sdk::prelude::{TreeHash, MAINNET_CONSTANTS};
     use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature};
     use chia_wallet_sdk::test::Simulator;
 
-    /// Mints a store on the simulator and returns its (settled) eve DataStore plus the owner keypair,
+    /// Mints a store on the simulator and returns its (settled) eve Datastore plus the owner keypair,
     /// so update tests start from a real on-chain store.
     fn minted_store(
         sim: &mut Simulator,
     ) -> anyhow::Result<(
         chia_wallet_sdk::test::BlsPairWithCoin,
-        DataStore<DigDataStoreMetadata>,
+        Datastore<DigDataStoreMetadata>,
     )> {
         let owner = sim.bls(1_000_000);
         let owner_ph: Bytes32 = StandardArgs::curry_tree_hash(owner.pk).into();
@@ -171,7 +171,7 @@ mod tests {
     }
 
     /// NON-VACUOUS owner preservation: the RECREATE `CREATE_COIN` actually targets the preserved
-    /// owner. `DataStore::from_spend` re-derives `child.info.owner_puzzle_hash` from the PARENT coin
+    /// owner. `Datastore::from_spend` re-derives `child.info.owner_puzzle_hash` from the PARENT coin
     /// (see the SDK: for an empty delegation set it uses the parent state-layer inner puzzle's tree
     /// hash), so `update_round_trips_a_new_root`'s `owner preserved` assert would STILL pass if the
     /// recreate had targeted an all-zero (or any wrong) owner. This pins the ACTUAL recreated coin's
@@ -199,7 +199,7 @@ mod tests {
         // store is empty-delegated, so the correct recreated coin is the singleton over the NFT state
         // layer over the owner's standard inner puzzle.
         let mut ctx = SpendContext::new();
-        let expected_layers = DataStoreInfo::new(
+        let expected_layers = DatastoreInfo::new(
             store.info.launcher_id,
             new_metadata,
             store.info.owner_puzzle_hash,
