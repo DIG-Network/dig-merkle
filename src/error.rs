@@ -37,7 +37,7 @@ pub enum MerkleError {
     #[error("failed to parse DataLayer coin: {0}")]
     Parse(String),
 
-    /// The supplied puzzle parsed successfully but is not a DataLayer (DataStore) singleton.
+    /// The supplied puzzle parsed successfully but is not a DataLayer (Datastore) singleton.
     #[error("coin is not a DataLayer singleton")]
     NotDataStore,
 

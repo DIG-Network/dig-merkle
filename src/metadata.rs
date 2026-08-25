@@ -1,4 +1,4 @@
-//! The DIG DataLayer metadata (SPEC §2) — the SDK's `DataStoreMetadata` shape with the exact-byte
+//! The DIG DataLayer metadata (SPEC §2) — the SDK's `DatastoreMetadata` shape with the exact-byte
 //! `"b"` size REPLACED by a power-of-2 `size_bucket` (`"sz"`), plus the additive `program_hash` (`"p"`).
 //!
 //! [`DigDataStoreMetadata`] carries `root_hash` + optional `label`/`description`/`size_proof` (the SDK
@@ -7,7 +7,7 @@
 //!
 //! - **Byte-identity when empty (INV-4, SPEC §5.1).** dig-merkle NEVER emits `"b"`. It appends
 //!   `("p" . program_hash)` then `("sz" . exponent)` LAST, each only when `Some`. With both `None` the
-//!   bytes are IDENTICAL to the SDK's `DataStoreMetadata` with `bytes == None` (it emits `l`/`d`/`sp`
+//!   bytes are IDENTICAL to the SDK's `DatastoreMetadata` with `bytes == None` (it emits `l`/`d`/`sp`
 //!   only) — a plain store is byte-for-byte an ordinary DataLayer store.
 //! - **SDK interop.** An SDK-typed reader decoding a DIG store ignores the unknown `"p"`/`"sz"` keys
 //!   (same `_ => ()` tolerance), and dig-merkle decoding an SDK store parses `root`/`l`/`d`/`sp` and
@@ -27,14 +27,14 @@ use clvm_traits::{ClvmDecoder, ClvmEncoder, FromClvm, FromClvmError, Raw, ToClvm
 
 use crate::size::SizeBucket;
 
-/// The DIG DataLayer metadata: the SDK's `DataStoreMetadata` shape with the exact byte count
+/// The DIG DataLayer metadata: the SDK's `DatastoreMetadata` shape with the exact byte count
 /// (`"b"`) REPLACED by a power-of-2 `size_bucket` (`"sz"`), plus the additive `program_hash` (`"p"`).
 ///
 /// This is the metadata `dig-merkle` curries into a minted store. The DIG store size is expressed as
 /// a coarse power-of-2 [`SizeBucket`] rather than an exact byte count — a clean replacement of the
 /// SDK's `bytes`/`"b"` field (pre-release: there are NO on-chain DIG stores carrying `"b"`). With
 /// `size_bucket == None && program_hash == None` it serializes byte-identically to the SDK's
-/// `DataStoreMetadata` with `bytes == None` (it emits `l`/`d`/`sp` only, never `"b"`) — an SDK-typed
+/// `DatastoreMetadata` with `bytes == None` (it emits `l`/`d`/`sp` only, never `"b"`) — an SDK-typed
 /// reader parses it and simply ignores the unknown `"sz"`/`"p"` keys (SPEC §8/§9).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DigDataStoreMetadata {
@@ -66,7 +66,7 @@ pub struct DigDataStoreMetadata {
 /// each only when `Some`.
 ///
 /// Never emitting `"b"` and appending the DIG keys only when present is the byte-identity guarantee:
-/// with `program_hash == None && size_bucket == None` the bytes equal the SDK's `DataStoreMetadata`
+/// with `program_hash == None && size_bucket == None` the bytes equal the SDK's `DatastoreMetadata`
 /// with `bytes == None` (SPEC §9).
 impl<N, E: ClvmEncoder<Node = N>> ToClvm<E> for DigDataStoreMetadata {
     fn to_clvm(&self, encoder: &mut E) -> Result<N, ToClvmError> {
@@ -173,7 +173,7 @@ impl MetadataWithRootHash for DigDataStoreMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chia_wallet_sdk::driver::{DataStoreMetadata, SpendContext};
+    use chia_wallet_sdk::driver::{DatastoreMetadata, SpendContext};
     use chia_wallet_sdk::prelude::{Allocator, NodePtr};
     use clvm_traits::{FromClvm, ToClvm};
 
@@ -212,7 +212,7 @@ mod tests {
     }
 
     /// With `size_bucket == None && program_hash == None`, the CLVM bytes are IDENTICAL to the SDK's
-    /// `DataStoreMetadata` with `bytes == None` — the clean-replacement byte-identity (SPEC §8/§9).
+    /// `DatastoreMetadata` with `bytes == None` — the clean-replacement byte-identity (SPEC §8/§9).
     /// dig-merkle emits NO `"b"` key, so the two encodings (l/d/sp) match exactly.
     #[test]
     fn metadata_none_size_bucket_is_byte_identical_to_sdk() {
@@ -226,7 +226,7 @@ mod tests {
             program_hash: None,
             size_bucket: None,
         };
-        let sdk = DataStoreMetadata {
+        let sdk = DatastoreMetadata {
             root_hash: root,
             label,
             description,
@@ -242,7 +242,7 @@ mod tests {
     }
 
     /// SDK-PARSE-COMPAT: a DIG store carrying a `size_bucket` (has `"sz"`, NO `"b"`) parses as a valid
-    /// `chia_wallet_sdk::driver::DataStoreMetadata` — the SDK ignores the unknown `"sz"`, and an
+    /// `chia_wallet_sdk::driver::DatastoreMetadata` — the SDK ignores the unknown `"sz"`, and an
     /// absent `"b"` decodes as `bytes == None`.
     #[test]
     fn sdk_reader_parses_size_bucket_store() {
@@ -258,7 +258,7 @@ mod tests {
 
         let mut ctx = SpendContext::new();
         let node = dig.to_clvm(&mut *ctx).expect("encode dig");
-        let sdk = DataStoreMetadata::from_clvm(&*ctx, node).expect("sdk decodes, ignoring sz");
+        let sdk = DatastoreMetadata::from_clvm(&*ctx, node).expect("sdk decodes, ignoring sz");
 
         assert_eq!(sdk.root_hash, root);
         assert_eq!(sdk.label, label);
@@ -361,7 +361,7 @@ mod tests {
         );
     }
 
-    /// §5.1 SDK-store readability + honest None: an SDK `DataStoreMetadata` carrying an exact-byte
+    /// §5.1 SDK-store readability + honest None: an SDK `DatastoreMetadata` carrying an exact-byte
     /// `"b"` DECODES successfully (root/l/d/sp parse, `"b"` ignored) with `size_bucket == None` — a
     /// foreign `"b"` is NOT a DIG size-proof, so the honest answer is no bucket. `bytes == None`
     /// likewise decodes to `size_bucket == None`.
@@ -369,7 +369,7 @@ mod tests {
     fn sdk_store_with_b_still_decodes() {
         let decode_sdk_bytes = |bytes: Option<u64>| -> DigDataStoreMetadata {
             let mut ctx = SpendContext::new();
-            let sdk = DataStoreMetadata {
+            let sdk = DatastoreMetadata {
                 root_hash: Bytes32::new([0x02; 32]),
                 label: Some("sdk".into()),
                 description: None,

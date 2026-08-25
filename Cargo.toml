@@ -15,7 +15,7 @@
 # foundation — their modules are declared as doc-only stubs so the layout is final.
 [package]
 name = "dig-merkle"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -31,13 +31,13 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # The chia-wallet-sdk umbrella is the byte-source-of-truth for every DataLayer puzzle, layer, and
-# spend (INV-4). Pinned to the 0.34 family the whole DIG on-chain line rides (chia-protocol 0.36.1).
+# spend (INV-4). Pinned to the 0.36 family the whole DIG on-chain line rides (chia-protocol 0.36.1).
 # The `chip-0035` feature gates the DataLayer/DataStore primitives (DataStore, DataStoreMetadata,
 # DataStoreInfo, DelegatedPuzzle, mint_datastore) — without it those types do not exist. We consume
 # the DataLayer primitive, the launcher, the standard p2 layer, the spend context, and the pure
 # signing calculator through it so the chia-* tree resolves to ONE coherent version set.
-chia-wallet-sdk = { version = "0.34", features = ["chip-0035"] }
-# Direct type deps, pinned to EXACTLY the versions chia-wallet-sdk 0.30 resolves to (a mismatch is a
+chia-wallet-sdk = { version = "0.36", features = ["chip-0035"] }
+# Direct type deps, pinned to EXACTLY the versions chia-wallet-sdk 0.36 resolves to (a mismatch is a
 # hard cargo error) — the 0.36.1 family. chia-protocol/chia-puzzle-types carry wire types the umbrella prelude does not
 # re-export (`Proof`, `LineageProof`); clvm-traits carries the CLVM (de)serialization traits.
 chia-protocol = "0.36.1"
@@ -57,7 +57,7 @@ dig-chainsource-interface = "0.3"
 
 [dev-dependencies]
 # The in-process Chia Simulator + BLS keypair helpers for building real coin spends in tests.
-chia-sdk-test = "0.34"
+chia-sdk-test = "0.36"
 # Hex assertions on computed signature messages / coin ids in tests.
 hex = "0.4"
 # Ergonomic `?`-propagating Result for the simulator integration tests.

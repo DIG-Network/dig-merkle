@@ -23,7 +23,7 @@ use crate::context::{drain_coin_spends, inner_spend};
 use crate::hint::{digstore_owner_hint, launcher_hint_for, StoreKind};
 use crate::metadata::DigDataStoreMetadata;
 use crate::size::SizeBucket;
-use crate::types::{Bytes32, Coin, DataStore, DelegatedPuzzle, MerkleCoinSpend, Owner};
+use crate::types::{Bytes32, Coin, Datastore, DelegatedPuzzle, MerkleCoinSpend, Owner};
 use crate::{MerkleError, MerkleResult};
 
 /// The well-known singleton launcher puzzle hash, as a coin puzzle hash. A `CREATE_COIN` to it mints
@@ -208,7 +208,7 @@ pub fn mint_datastore_with_kind(
 ///
 /// `parent_conditions` are allocated in the [`SpendContext`] passed to
 /// [`mint_datastore_launch_with_kind`] and are valid ONLY in that context — `Conditions` holds CLVM
-/// node pointers that index into the allocator that built them. The launcher-coin and eve-DataStore
+/// node pointers that index into the allocator that built them. The launcher-coin and eve-Datastore
 /// spends are already staged into that same context; the caller adds its parent-coin spend and drains
 /// the context ONCE, at the end.
 /// Marked `#[non_exhaustive]` so a future launch fact can be reported without breaking downstream
@@ -224,8 +224,8 @@ pub struct DatastoreLaunch {
     /// the caller adds them to its own spend.
     pub parent_conditions: Conditions,
 
-    /// The eve DataStore as it will exist once the launch confirms.
-    pub datastore: DataStore<DigDataStoreMetadata>,
+    /// The eve Datastore as it will exist once the launch confirms.
+    pub datastore: Datastore<DigDataStoreMetadata>,
 
     /// Whether this launch actually wrote the launcher memos — the two-memo owner-discovery hint AND
     /// the [`StoreKind`] discriminator (SPEC §9).
@@ -246,7 +246,7 @@ pub struct DatastoreLaunch {
 /// caller's parent-coin spend must emit (SPEC §3.1).
 ///
 /// This is the composable half of [`mint_datastore_with_kind`]: it stages the launcher-coin and
-/// eve-DataStore spends into `ctx` and hands back the parent conditions, leaving the caller free to
+/// eve-Datastore spends into `ctx` and hands back the parent conditions, leaving the caller free to
 /// authorize the parent coin however it likes — a DID-authorized spend, a vault, a multisig — and to
 /// add its own change and fee. `mint_datastore_with_kind` is exactly this function plus a standard-p2
 /// parent spend, so both paths emit identical bytes by construction.
@@ -264,7 +264,7 @@ pub struct DatastoreLaunch {
 /// without dig-merkle knowing anything about DIDs or singletons:
 ///
 /// - **An ordinary coin** parents the launcher directly: `Launcher::new(parent_coin.coin_id(), 1)`.
-/// - **A singleton** (a DID, another DataStore, a vault singleton) MUST interpose an intermediate
+/// - **A singleton** (a DID, another Datastore, a vault singleton) MUST interpose an intermediate
 ///   coin: `IntermediateLauncher::new(parent_coin.coin_id(), 0, 1).create(ctx)?`. A Chia singleton's
 ///   inner puzzle may emit exactly ONE odd-amount `CREATE_COIN` — its own successor — so a 1-mojo
 ///   launcher emitted alongside the recreation is a second odd output and the bundle is REJECTED on
@@ -331,7 +331,7 @@ pub fn mint_datastore_launch_with_kind(
     let launcher_coin = launcher.coin();
     assert_launcher_is_legal(launcher_coin, launcher.singleton_amount())?;
 
-    // Build the launcher + eve DataStore via the SDK (the byte-source-of-truth, INV-4). The returned
+    // Build the launcher + eve Datastore via the SDK (the byte-source-of-truth, INV-4). The returned
     // conditions are what the parent coin must emit to create the launcher coin.
     let (launch_conditions, datastore) = launcher.mint_datastore(
         ctx,
@@ -601,7 +601,7 @@ fn override_launcher_hint(
 mod tests {
     use super::*;
     use crate::required_signatures;
-    use crate::types::DataStore;
+    use crate::types::Datastore;
     use chia_puzzle_types::standard::StandardArgs;
     use chia_puzzle_types::Memos;
     use chia_wallet_sdk::driver::SpendContext;
@@ -742,7 +742,7 @@ mod tests {
         assert_eq!(car, root, "root_hash must be the first metadata atom");
     }
 
-    /// The mint validates on the in-process simulator and the eve DataStore hydrates back with the
+    /// The mint validates on the in-process simulator and the eve Datastore hydrates back with the
     /// same root, owner, and delegated-puzzle set (SPEC §5 roundtrip).
     #[test]
     fn mint_validates_and_hydrates_on_simulator() -> anyhow::Result<()> {
@@ -777,7 +777,7 @@ mod tests {
             .find(|s| s.coin.coin_id() == datastore.info.launcher_id)
             .expect("launcher-coin spend present");
         let hydrated =
-            DataStore::<DigDataStoreMetadata>::from_spend(&mut ctx, launcher_spend, &[])?
+            Datastore::<DigDataStoreMetadata>::from_spend(&mut ctx, launcher_spend, &[])?
                 .expect("launcher spend hydrates a datastore");
 
         assert_eq!(hydrated.info.metadata.root_hash, root);
@@ -858,7 +858,7 @@ mod tests {
         );
     }
 
-    /// Builds the same coin spends `mint_datastore` does but currying the SDK's `DataStoreMetadata`
+    /// Builds the same coin spends `mint_datastore` does but currying the SDK's `DatastoreMetadata`
     /// (with `bytes == None`, since dig-merkle never emits `"b"`), so a byte-identity comparison
     /// isolates JUST the metadata type swap.
     #[allow(clippy::too_many_arguments)]
@@ -872,7 +872,7 @@ mod tests {
         owner_puzzle_hash: Bytes32,
         fee: u64,
     ) -> Vec<crate::types::CoinSpend> {
-        use chia_wallet_sdk::driver::DataStoreMetadata;
+        use chia_wallet_sdk::driver::DatastoreMetadata;
 
         let mut ctx = SpendContext::new();
         let reference_launcher = Launcher::new(parent_coin.coin_id(), 1);
@@ -880,7 +880,7 @@ mod tests {
         let (launch_conditions, _datastore) = reference_launcher
             .mint_datastore(
                 &mut ctx,
-                DataStoreMetadata {
+                DatastoreMetadata {
                     root_hash: root,
                     label,
                     description,
@@ -924,7 +924,7 @@ mod tests {
     }
 
     /// LOAD-BEARING back-compat proof (§5.1): a mint with `program_hash == None` produces coin spends
-    /// BYTE-IDENTICAL to a mint currying the SDK's own `DataStoreMetadata` — so an ordinary DIG store
+    /// BYTE-IDENTICAL to a mint currying the SDK's own `DatastoreMetadata` — so an ordinary DIG store
     /// is indistinguishable on chain from a plain DataLayer store.
     #[test]
     fn mint_none_program_hash_is_byte_identical() {
@@ -998,7 +998,7 @@ mod tests {
             .find(|s| s.coin.coin_id() == datastore.info.launcher_id)
             .expect("launcher-coin spend present");
         let hydrated =
-            DataStore::<DigDataStoreMetadata>::from_spend(&mut ctx, launcher_spend, &[])?
+            Datastore::<DigDataStoreMetadata>::from_spend(&mut ctx, launcher_spend, &[])?
                 .expect("launcher spend hydrates a datastore");
 
         assert_eq!(hydrated.info.metadata.root_hash, root);
@@ -1044,7 +1044,7 @@ mod tests {
             .find(|s| s.coin.coin_id() == datastore.info.launcher_id)
             .expect("launcher-coin spend present");
         let hydrated =
-            DataStore::<DigDataStoreMetadata>::from_spend(&mut ctx, launcher_spend, &[])?
+            Datastore::<DigDataStoreMetadata>::from_spend(&mut ctx, launcher_spend, &[])?
                 .expect("launcher spend hydrates a datastore");
 
         assert_eq!(hydrated.info.metadata.root_hash, root);
@@ -1248,7 +1248,7 @@ mod tests {
         assert_eq!(
             wrapper.child.expect("wrapper yields a datastore").info,
             launch.datastore.info,
-            "both paths describe the same eve DataStore"
+            "both paths describe the same eve Datastore"
         );
     }
 
@@ -1327,7 +1327,7 @@ mod tests {
             .iter()
             .find(|spend| spend.coin.coin_id() == store_id)
             .expect("the launcher coin was spent");
-        let hydrated = DataStore::<DigDataStoreMetadata>::from_spend(
+        let hydrated = Datastore::<DigDataStoreMetadata>::from_spend(
             &mut SpendContext::new(),
             launcher_spend,
             &[],
@@ -1562,7 +1562,7 @@ mod tests {
             .expect("an odd-amount launch is accepted");
         assert!(
             ctx.iter().count() > 0,
-            "an accepted launch stages the launcher and eve-DataStore spends (control)"
+            "an accepted launch stages the launcher and eve-Datastore spends (control)"
         );
     }
 

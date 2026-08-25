@@ -1,8 +1,8 @@
 //! Reconstructing a spendable DataLayer coin from its parent spend (SPEC §5) — fail-closed.
 //!
-//! To spend an existing DataLayer coin a caller needs the current [`DataStore`] — coin, lineage
+//! To spend an existing DataLayer coin a caller needs the current [`Datastore`] — coin, lineage
 //! proof, metadata, owner, and delegation set. [`hydrate`] reconstructs it from the coin spend that
-//! CREATED it (its parent's spend), delegating the parse to the SDK's `DataStore::from_spend` (the
+//! CREATED it (its parent's spend), delegating the parse to the SDK's `Datastore::from_spend` (the
 //! byte-source-of-truth, INV-4). It performs NO network I/O; the caller supplies the real parent
 //! spend from a trusted chain source.
 //!
@@ -13,7 +13,7 @@
 
 use clvm_traits::ToClvm;
 
-use chia_wallet_sdk::driver::{DataStore, DriverError, Puzzle, SpendContext};
+use chia_wallet_sdk::driver::{Datastore, DriverError, Puzzle, SpendContext};
 use chia_wallet_sdk::prelude::Allocator;
 
 use crate::metadata::DigDataStoreMetadata;
@@ -47,7 +47,7 @@ fn require_reveal_matches_coin(spend: &CoinSpend) -> MerkleResult<()> {
     Ok(())
 }
 
-/// Reconstructs the spendable [`DataStore`] created by `parent_spend`.
+/// Reconstructs the spendable [`Datastore`] created by `parent_spend`.
 ///
 /// `parent_spend` is the coin spend that produced the store coin to be hydrated — either the
 /// launcher spend (for an eve store) or a prior recreation spend. The returned store carries the
@@ -66,12 +66,12 @@ fn require_reveal_matches_coin(spend: &CoinSpend) -> MerkleResult<()> {
 ///   executed.
 /// - [`MerkleError::Parse`] — `parent_spend`'s puzzle reveal is not allocatable CLVM.
 /// - [`MerkleError::Driver`] — any other SDK parse failure.
-pub fn hydrate(parent_spend: &CoinSpend) -> MerkleResult<DataStore<DigDataStoreMetadata>> {
+pub fn hydrate(parent_spend: &CoinSpend) -> MerkleResult<Datastore<DigDataStoreMetadata>> {
     require_reveal_matches_coin(parent_spend)?;
 
     let mut ctx = SpendContext::new();
 
-    match DataStore::<DigDataStoreMetadata>::from_spend(&mut ctx, parent_spend, &[]) {
+    match Datastore::<DigDataStoreMetadata>::from_spend(&mut ctx, parent_spend, &[]) {
         Ok(Some(store)) => Ok(store),
         Ok(None) => Err(MerkleError::NotDataStore),
         // A spend that recreated no odd (singleton) coin — a terminal melt — leaves nothing to
@@ -92,7 +92,7 @@ mod tests {
     use chia_protocol::Bytes;
     use chia_puzzle_types::singleton::LauncherSolution;
     use chia_puzzle_types::standard::StandardArgs;
-    use chia_wallet_sdk::driver::{DlLauncherKvList, StandardLayer};
+    use chia_wallet_sdk::driver::{DelegatedPuzzle, DlLauncherKvList, StandardLayer};
     use chia_wallet_sdk::test::Simulator;
 
     /// hydrate reconstructs a spendable store from a real launcher spend: the reconstructed store has
@@ -365,6 +365,87 @@ mod tests {
         assert!(
             matches!(hydrate(&crafted), Err(MerkleError::MissingHint)),
             "a launcher hint declaring an oracle puzzle without its fee fails closed to MissingHint"
+        );
+        Ok(())
+    }
+
+    /// An oracle fee memo that is PRESENT BUT EMPTY is a different input from an ABSENT one, and it
+    /// reaches a different upstream branch: the absent case runs out of memos (`MissingMemo`), while
+    /// the empty case hands a zero-length byte string to the fee decoder. Under chia-wallet-sdk 0.34
+    /// that decoder indexed the first digit of the parsed `BigInt` unconditionally, so a zero-length
+    /// memo — which parses to zero and therefore has NO digits — panicked on an out-of-bounds index.
+    /// Memos on a launcher solution are attacker-shaped data read straight off chain, so that panic
+    /// was reachable by anyone able to publish a coin. 0.36 decodes an empty memo as a zero fee and
+    /// returns `InvalidMemo` rather than panicking on an oversized one.
+    ///
+    /// The fixture differs from the sibling test above by exactly one byte-string: the fee memo is
+    /// included and empty rather than omitted. That single-field variation is what separates this
+    /// property from the absent-memo path; reusing the truncated fixture would re-test `MissingMemo`
+    /// and never reach the decoder at all.
+    #[test]
+    fn hydrate_accepts_an_empty_oracle_fee_memo_as_a_zero_fee() -> anyhow::Result<()> {
+        let mut sim = Simulator::new();
+        let owner = sim.bls(1_000_000);
+        let owner_ph: Bytes32 = StandardArgs::curry_tree_hash(owner.pk).into();
+
+        let built = mint_datastore(
+            owner.coin,
+            Owner::Standard(owner.pk),
+            Bytes32::new([0x5a; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph,
+            vec![],
+            0,
+        )?;
+        let minted = built.child.expect("mint yields a child");
+        let launcher_spend = built
+            .coin_spends
+            .iter()
+            .find(|s| s.coin.coin_id() == minted.info.launcher_id)
+            .expect("launcher-coin spend present");
+
+        let oracle_ph = Bytes32::new([0x33; 32]);
+        let kv = DlLauncherKvList {
+            metadata: DigDataStoreMetadata {
+                root_hash: Bytes32::new([0x5a; 32]),
+                ..Default::default()
+            },
+            state_layer_inner_puzzle_hash: owner_ph,
+            memos: vec![
+                Bytes::from(owner_ph.to_vec()),
+                Bytes::new(vec![3u8]), // HintType::OraclePuzzle
+                Bytes::from(oracle_ph.to_vec()),
+                Bytes::new(Vec::new()), // the fee memo, PRESENT and EMPTY.
+            ],
+        };
+        let solution = LauncherSolution {
+            singleton_puzzle_hash: Bytes32::new([0x44; 32]),
+            amount: 1,
+            key_value_list: kv,
+        };
+
+        let mut ctx = SpendContext::new();
+        let solution_ptr = ctx.alloc(&solution)?;
+        let malformed_solution = ctx.serialize(&solution_ptr)?;
+        let crafted = CoinSpend::new(
+            launcher_spend.coin,
+            launcher_spend.puzzle_reveal.clone(),
+            malformed_solution,
+        );
+
+        // Reaching any verdict at all is the point: on 0.34 this call aborted the process.
+        let store = hydrate(&crafted).expect("an empty fee memo decodes rather than panicking");
+        assert!(
+            store
+                .info
+                .delegated_puzzles
+                .iter()
+                .any(|p| matches!(p, DelegatedPuzzle::Oracle(ph, fee) if *ph == oracle_ph && *fee == 0)),
+            "the empty fee memo decodes to an oracle puzzle carrying a zero fee, not to some other              delegated-puzzle shape"
         );
         Ok(())
     }
